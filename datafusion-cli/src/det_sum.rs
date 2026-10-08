@@ -2,28 +2,26 @@
 //!
 //! Floating point addition is not associative, so the result of `sum` depends
 //! on how rows are split into partitions and batches. `det_sum` instead
-//! computes the exact sum and rounds it once:
+//! computes the exact sum and rounds it once, using [`bitrep::SumF64`]:
 //!
 //! 1. Every finite `f64` is an integer multiple of 2⁻¹⁰⁷⁴, the smallest
 //!    subnormal. It is converted to that integer, stored in a 2176-bit two's
 //!    complement number, and added with integer arithmetic. Integer addition
 //!    is exact, so the sum does not depend on the order of the values, and
-//!    the width leaves room for 2⁶⁴ values of any magnitude without overflow.
-//! 2. Non-finite values are summed separately: any NaN or both infinities
+//!    the width leaves room for 2⁶³ values of any magnitude without overflow.
+//! 2. Non-finite values are tracked as flags: any NaN or both infinities
 //!    give NaN, a single kind of infinity gives that infinity.
 //! 3. Partial aggregates are merged by adding their integers.
 //! 4. The final integer is rounded to the nearest `f64`, ties to even, as a
 //!    single IEEE 754 addition would; sums beyond the `f64` range become ±inf.
 
 use {
+    bitrep::SumF64,
     datafusion::{
-        arrow::{
-            array::{Array, ArrayRef, ListArray},
-            datatypes::{DataType, UInt64Type},
-        },
+        arrow::{array::ArrayRef, datatypes::DataType},
         common::{
             Result, ScalarValue,
-            cast::{as_float64_array, as_list_array, as_uint64_array},
+            cast::{as_fixed_size_binary_array, as_float64_array},
             internal_err,
         },
         logical_expr::{Accumulator, AggregateUDF, Volatility, create_udaf},
@@ -40,171 +38,45 @@ pub fn det_sum() -> AggregateUDF {
         Arc::new(DataType::Float64),
         Volatility::Immutable,
         Arc::new(|_| Ok(Box::new(ExactSumAccumulator::default()))),
-        Arc::new(vec![
-            DataType::new_list(DataType::UInt64, true),
-            DataType::Float64,
-        ]),
+        Arc::new(vec![DataType::FixedSizeBinary(STATE_BYTES)]),
     )
 }
 
-/// Holds any sum of up to 2⁶⁴ finite `f64` values plus a sign bit:
-/// 1074 fraction bits + 1024 integer bits + 64 + 1 ≤ 34 · 64.
-const LIMBS: usize = 34;
-
-/// A two's complement fixed-point number whose least significant bit is 2⁻¹⁰⁷⁴,
-/// the smallest subnormal `f64`. Every finite `f64` is exactly representable,
-/// so sums are exact and do not depend on the order of additions.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct FixedPoint([u64; LIMBS]);
-
-impl Default for FixedPoint {
-    fn default() -> Self {
-        Self([0; LIMBS])
-    }
-}
-
-impl FixedPoint {
-    fn from_f64(x: f64) -> Self {
-        let bits = x.to_bits();
-        let biased_exponent = (bits >> 52) & 0x7ff;
-        let fraction = bits & ((1 << 52) - 1);
-        // |x| = mantissa · 2^(shift − 1074)
-        let (mantissa, shift) = if biased_exponent == 0 {
-            (fraction, 0)
-        } else {
-            (fraction | (1 << 52), biased_exponent - 1)
-        };
-
-        let mut result = Self::default();
-        let limb = (shift / 64) as usize;
-        let wide = u128::from(mantissa) << (shift % 64);
-        result.0[limb] = wide as u64;
-        result.0[limb + 1] = (wide >> 64) as u64;
-        if x.is_sign_negative() {
-            result.negated()
-        } else {
-            result
-        }
-    }
-
-    fn add(&mut self, other: &Self) {
-        let mut carry = false;
-        for (limb, &other_limb) in self.0.iter_mut().zip(&other.0) {
-            let (sum, carry1) = limb.overflowing_add(other_limb);
-            let (sum, carry2) = sum.overflowing_add(u64::from(carry));
-            *limb = sum;
-            carry = carry1 || carry2;
-        }
-    }
-
-    fn negated(&self) -> Self {
-        let mut result = Self(self.0.map(|limb| !limb));
-        let mut one = Self::default();
-        one.0[0] = 1;
-        result.add(&one);
-        result
-    }
-
-    fn is_negative(&self) -> bool {
-        self.0[LIMBS - 1] >> 63 == 1
-    }
-
-    fn bit(&self, i: usize) -> bool {
-        (self.0[i / 64] >> (i % 64)) & 1 == 1
-    }
-
-    fn bit_len(&self) -> usize {
-        self.0
-            .iter()
-            .rposition(|&limb| limb != 0)
-            .map_or(0, |i| i * 64 + 64 - self.0[i].leading_zeros() as usize)
-    }
-
-    /// Rounds to the nearest `f64`, ties to even, as IEEE 754 addition does.
-    fn to_f64(self) -> f64 {
-        if self.is_negative() {
-            return -self.negated().to_f64();
-        }
-
-        let len = self.bit_len();
-        if len <= 53 {
-            // A subnormal or the smallest normal exponent: the value in units
-            // of 2⁻¹⁰⁷⁴ is exactly the bit pattern.
-            return f64::from_bits(self.0[0]);
-        }
-
-        let shift = len - 53;
-        let mut mantissa = (shift..len)
-            .rev()
-            .fold(0, |mantissa, i| (mantissa << 1) | u64::from(self.bit(i)));
-        let half = self.bit(shift - 1);
-        let more_than_half = (0..shift - 1).any(|i| self.bit(i));
-        if half && (more_than_half || mantissa & 1 == 1) {
-            mantissa += 1;
-        }
-        // The mantissa includes the implicit leading bit, so adding it to the
-        // exponent field bumps the exponent by one; so does a rounding carry.
-        let bits = ((shift as u64) << 52) + mantissa;
-        f64::from_bits(bits.min(f64::INFINITY.to_bits()))
-    }
-}
+/// The state is [`SumF64::to_bytes`].
+const STATE_BYTES: i32 = SumF64::BYTES as i32;
 
 #[derive(Debug, Default)]
 struct ExactSumAccumulator {
-    finite_sum: FixedPoint,
-    /// Sum of the non-finite inputs: 0, ±inf or NaN.
-    special_sum: f64,
-    seen_any: bool,
+    sum: SumF64,
 }
 
 impl Accumulator for ExactSumAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-        for x in as_float64_array(&values[0])?.iter().flatten() {
-            self.seen_any = true;
-            if x.is_finite() {
-                self.finite_sum.add(&FixedPoint::from_f64(x));
-            } else {
-                self.special_sum += x;
-            }
-        }
+        self.sum
+            .extend(as_float64_array(&values[0])?.iter().flatten());
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-        let finite_sums = as_list_array(&states[0])?;
-        let special_sums = as_float64_array(&states[1])?;
-        for i in 0..finite_sums.len() {
-            if finite_sums.is_null(i) {
-                continue;
-            }
-            let limbs = finite_sums.value(i);
-            let Ok(limbs) = as_uint64_array(&limbs)?.values().as_ref().try_into() else {
-                return internal_err!("det_sum state must have {LIMBS} limbs");
+        for bytes in as_fixed_size_binary_array(&states[0])?.iter().flatten() {
+            let Some(partial) = bytes.try_into().ok().and_then(SumF64::from_bytes) else {
+                return internal_err!("invalid det_sum state");
             };
-            self.seen_any = true;
-            self.finite_sum.add(&FixedPoint(limbs));
-            self.special_sum += special_sums.value(i);
+            self.sum.merge(&partial);
         }
         Ok(())
     }
 
-    /// The limbs of `finite_sum`, NULL when no values were seen, and `special_sum`.
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let limbs = self.seen_any.then(|| self.finite_sum.0.map(Some));
-        let limbs = ListArray::from_iter_primitive::<UInt64Type, _, _>([limbs]);
-        Ok(vec![
-            ScalarValue::List(Arc::new(limbs)),
-            ScalarValue::Float64(Some(self.special_sum)),
-        ])
+        Ok(vec![ScalarValue::FixedSizeBinary(
+            STATE_BYTES,
+            Some(self.sum.to_bytes().to_vec()),
+        )])
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let sum = if self.special_sum != 0.0 {
-            self.special_sum
-        } else {
-            self.finite_sum.to_f64()
-        };
-        Ok(ScalarValue::Float64(self.seen_any.then_some(sum)))
+        let sum = (self.sum.count() > 0).then(|| self.sum.value());
+        Ok(ScalarValue::Float64(sum))
     }
 
     fn size(&self) -> usize {
@@ -244,7 +116,7 @@ mod tests {
 
     /// Test cases of CPython's `testFsum` in `Lib/test/test_math.py`.
     #[test]
-    fn matches_python_fsum() -> Result<()> {
+    fn is_correctly_rounded() -> Result<()> {
         let harmonic: Vec<f64> = (1..=1000).map(|n| 1.0 / f64::from(n)).collect();
         let alternating: Vec<f64> = (1..=1000)
             .map(|n| if n % 2 == 0 { 1.0 } else { -1.0 } / f64::from(n))
