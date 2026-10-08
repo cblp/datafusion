@@ -3713,7 +3713,7 @@ mod tests {
         Int64Array, NullArray, StringArray, StructArray, UInt32Array, UInt64Array,
     };
     use arrow::compute::{SortOptions, concat_batches};
-    use arrow::datatypes::{Float64Type, Int32Type, Int64Type, UInt32Type};
+    use arrow::datatypes::{Int32Type, Int64Type, UInt32Type};
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{DataFusionError, assert_contains, internal_err};
     use datafusion_execution::config::SessionConfig;
@@ -5862,7 +5862,7 @@ mod tests {
     fn partial_reduce_test_aggregate() -> Result<AggregateExec> {
         partial_reduce_test_aggregate_with_input(
             vec![1, 2, 1, 3],
-            vec![10.0, 20.0, 40.0, 30.0],
+            vec![10, 20, 40, 30],
             1,
         )
     }
@@ -5871,12 +5871,12 @@ mod tests {
     /// input batches of partial states with group keys `a` and partial sums `b`.
     fn partial_reduce_test_aggregate_with_input(
         a: Vec<u32>,
-        b: Vec<f64>,
+        b: Vec<i64>,
         num_input_batches: usize,
     ) -> Result<AggregateExec> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::UInt32, false),
-            Field::new("b", DataType::Float64, false),
+            Field::new("b", DataType::Int64, false),
         ]));
         let group_by =
             PhysicalGroupBy::new_single(vec![(col("a", &schema)?, "a".to_string())]);
@@ -5902,7 +5902,7 @@ mod tests {
             Arc::clone(&partial_schema),
             vec![
                 Arc::new(UInt32Array::from(a)),
-                Arc::new(Float64Array::from(b)),
+                Arc::new(Int64Array::from(b)),
             ],
         )?;
         let partial_reduce_input = TestMemoryExec::try_new_exec(
@@ -5953,7 +5953,7 @@ mod tests {
         let num_groups = 256;
         let partial_reduce = partial_reduce_test_aggregate_with_input(
             (0..num_groups).collect(),
-            (0..num_groups).map(f64::from).collect(),
+            (0..num_groups).map(i64::from).collect(),
             num_input_batches,
         )?;
         // Fits only the initial table, so every input batch triggers an early emit.
@@ -5991,9 +5991,9 @@ mod tests {
         assert_eq!(batch_rows, [100, 100, 56].repeat(num_input_batches));
         let output = concat_batches(&output[0].schema(), &output)?;
         let a = output.column(0).as_primitive::<UInt32Type>();
-        let sums = output.column(1).as_primitive::<Float64Type>();
+        let sums = output.column(1).as_primitive::<Int64Type>();
         for row in 0..output.num_rows() {
-            assert_eq!(sums.value(row), f64::from(a.value(row)));
+            assert_eq!(sums.value(row), i64::from(a.value(row)));
         }
         // Each flush contains every group exactly once.
         for flush in a.values().chunks(num_groups as usize) {
@@ -6013,7 +6013,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::UInt32, false),
             Field::new("n", DataType::Null, true),
-            Field::new("b", DataType::Float64, false),
+            Field::new("b", DataType::Int64, false),
         ]));
         let group_by = PhysicalGroupBy::new_single(vec![
             (col("a", &schema)?, "a".to_string()),
@@ -6042,7 +6042,7 @@ mod tests {
             vec![
                 Arc::new(UInt32Array::from(vec![1, 2, 1, 3])),
                 Arc::new(NullArray::new(4)),
-                Arc::new(Float64Array::from(vec![10.0, 20.0, 40.0, 30.0])),
+                Arc::new(Int64Array::from(vec![10, 20, 40, 30])),
             ],
         )?;
         let partial_reduce_input = TestMemoryExec::try_new_exec(
@@ -6105,15 +6105,15 @@ mod tests {
         +---+---+-------------+
         | a | n | SUM(b)[sum] |
         +---+---+-------------+
-        | 1 |   | 50.0        |
-        | 2 |   | 20.0        |
-        | 3 |   | 30.0        |
-        | 1 |   | 50.0        |
-        | 2 |   | 20.0        |
-        | 3 |   | 30.0        |
-        | 1 |   | 50.0        |
-        | 2 |   | 20.0        |
-        | 3 |   | 30.0        |
+        | 1 |   | 50          |
+        | 2 |   | 20          |
+        | 3 |   | 30          |
+        | 1 |   | 50          |
+        | 2 |   | 20          |
+        | 3 |   | 30          |
+        | 1 |   | 50          |
+        | 2 |   | 20          |
+        | 3 |   | 30          |
         +---+---+-------------+
         ");
 

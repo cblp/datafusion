@@ -50,6 +50,8 @@ use datafusion_macros::user_doc;
 use datafusion_physical_expr::expressions::{CastExpr, Column};
 use std::mem::{size_of, size_of_val};
 
+mod float;
+
 make_udaf_expr_and_func!(
     Sum,
     sum,
@@ -148,7 +150,7 @@ macro_rules! downcast_sum {
 
 #[user_doc(
     doc_section(label = "General Functions"),
-    description = "Returns the sum of all values in the specified column.",
+    description = "Returns the sum of all values in the specified column. Floating point values are summed exactly and rounded once, so the result does not depend on the order of the values.",
     syntax_example = "sum(expression)",
     sql_example = r#"```sql
 > SELECT sum(column_name) FROM table_name;
@@ -262,6 +264,13 @@ impl AggregateUDFImpl for Sum {
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         let is_distinct = args.is_distinct;
+        if sums_floats(&args) {
+            return Ok(if is_distinct {
+                Box::new(float::DistinctFloatSumAccumulator::default())
+            } else {
+                Box::new(float::FloatSumAccumulator::default())
+            });
+        }
         macro_rules! helper {
             ($t:ty, $dt:expr) => {
                 if is_distinct {
@@ -286,6 +295,10 @@ impl AggregateUDFImpl for Sum {
                 )
                 .into(),
             ])
+        } else if args.return_type() == &DataType::Float64 {
+            Ok(vec![float::state_field(format_state_name(
+                args.name, "sum",
+            ))])
         } else {
             Ok(vec![
                 Field::new(
@@ -306,6 +319,9 @@ impl AggregateUDFImpl for Sum {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
+        if sums_floats(&args) {
+            return Ok(Box::new(float::FloatSumGroupsAccumulator::default()));
+        }
         macro_rules! helper {
             ($t:ty, $dt:expr) => {
                 Ok(Box::new(PrimitiveGroupsAccumulator::<$t, _>::new(
@@ -334,6 +350,8 @@ impl AggregateUDFImpl for Sum {
                     args.expr_fields[0].data_type()
                 ),
             }
+        } else if sums_floats(&args) {
+            Ok(Box::new(float::SlidingFloatSumAccumulator::default()))
         } else {
             // non‐distinct path: existing sliding sum
             macro_rules! helper {
@@ -394,7 +412,9 @@ impl AggregateUDFImpl for Sum {
                 );
             }
         };
-        if lit_type == DataType::Null {
+        // `sum(arg) + lit * count(arg)` rounds differently from the exact
+        // floating point sum of `arg + lit`
+        if lit_type == DataType::Null || lit_type.is_floating() {
             return Ok(None);
         }
 
@@ -411,7 +431,10 @@ impl AggregateUDFImpl for Sum {
     }
 
     fn value_from_stats(&self, statistics_args: &StatisticsArgs) -> Option<ScalarValue> {
-        if statistics_args.is_distinct {
+        // Floating point sums in statistics are not computed exactly
+        if statistics_args.is_distinct
+            || statistics_args.return_type == &DataType::Float64
+        {
             return None;
         }
 
@@ -461,6 +484,12 @@ impl AggregateUDFImpl for Sum {
             val.cast_to(statistics_args.return_type).ok()
         }
     }
+}
+
+/// Floating point input is coerced to `Float64` and summed by the accumulators
+/// in [`float`], whose result does not depend on the summation order.
+fn sums_floats(args: &AccumulatorArgs) -> bool {
+    args.return_field.data_type() == &DataType::Float64
 }
 
 /// This accumulator computes SUM incrementally

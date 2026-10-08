@@ -1036,6 +1036,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
+name = "bitrep"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b324609691c7673751b8d875a9aeec38d7052f2e69370f988c78ddb5d5c3cb"
+
+[[package]]
 name = "blake2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2308,6 +2314,7 @@ version = "55.1.0"
 dependencies = [
  "arrow",
  "arrow-select",
+ "bitrep",
  "criterion",
  "datafusion-common",
  "datafusion-doc",

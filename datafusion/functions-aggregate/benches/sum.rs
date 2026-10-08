@@ -19,7 +19,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray};
-use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
 use arrow::util::bench_util::{create_boolean_array, create_primitive_array};
 
 use datafusion_expr::{AggregateUDFImpl, GroupsAccumulator, function::AccumulatorArgs};
@@ -66,6 +66,29 @@ fn convert_to_state_bench(
     });
 }
 
+#[expect(clippy::needless_pass_by_value)]
+fn update_batch_bench(
+    c: &mut Criterion,
+    name: &str,
+    values: ArrayRef,
+    num_groups: usize,
+) {
+    let mut accumulator = prepare_accumulator(values.data_type());
+    let group_indices: Vec<usize> = (0..values.len()).map(|i| i % num_groups).collect();
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            accumulator
+                .update_batch(
+                    std::slice::from_ref(&values),
+                    &group_indices,
+                    None,
+                    num_groups,
+                )
+                .unwrap()
+        })
+    });
+}
+
 fn count_benchmark(c: &mut Criterion) {
     let values = Arc::new(create_primitive_array::<Int64Type>(8192, 0.0)) as ArrayRef;
     convert_to_state_bench(c, "sum i64 convert state no nulls, no filter", values, None);
@@ -103,6 +126,27 @@ fn count_benchmark(c: &mut Criterion) {
         values,
         Some(&filter),
     );
+
+    let values = Arc::new(create_primitive_array::<Float64Type>(8192, 0.0)) as ArrayRef;
+    convert_to_state_bench(c, "sum f64 convert state no nulls, no filter", values, None);
+
+    for num_groups in [1, 1000] {
+        let values = Arc::new(create_primitive_array::<Int64Type>(8192, 0.0)) as ArrayRef;
+        update_batch_bench(
+            c,
+            &format!("sum i64 update batch {num_groups} groups"),
+            values,
+            num_groups,
+        );
+        let values =
+            Arc::new(create_primitive_array::<Float64Type>(8192, 0.0)) as ArrayRef;
+        update_batch_bench(
+            c,
+            &format!("sum f64 update batch {num_groups} groups"),
+            values,
+            num_groups,
+        );
+    }
 }
 
 criterion_group!(benches, count_benchmark);

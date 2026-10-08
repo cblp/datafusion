@@ -528,7 +528,7 @@ string_agg([DISTINCT] expression, delimiter [ORDER BY expression])
 
 ### `sum`
 
-Returns the sum of all values in the specified column.
+Returns the sum of all values in the specified column. Floating point values are summed exactly and rounded once, so the result does not depend on the order of the values.
 
 ```sql
 sum(expression)

@@ -43,6 +43,7 @@ name = "datafusion_functions_aggregate"
 [dependencies]
 arrow = { workspace = true }
 arrow-select = { workspace = true }
+bitrep = "0.5.1"
 datafusion-common = { workspace = true }
 datafusion-doc = { workspace = true }
 datafusion-execution = { workspace = true }

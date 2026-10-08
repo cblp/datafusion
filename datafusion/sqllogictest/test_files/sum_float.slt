@@ -1,0 +1,277 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# `sum` of floating point numbers computes the exact sum and rounds it once,
+# so the result does not depend on the summation order. Results are cast to
+# strings to show every bit.
+
+# Exact sum, rounded once
+query TT
+SELECT
+  arrow_cast(sum(x), 'Utf8'),
+  arrow_cast(sum(x) FILTER (WHERE x < 0.3), 'Utf8')
+FROM (VALUES (0.1), (0.2), (0.3)) AS t(x)
+----
+0.6 0.30000000000000004
+
+# The order of the values does not matter
+query TT
+SELECT
+  (SELECT arrow_cast(sum(x), 'Utf8') FROM (VALUES (1e16), (1.0), (-1e16)) AS t(x)) AS a,
+  (SELECT arrow_cast(sum(x), 'Utf8') FROM (VALUES (1.0), (1e16), (-1e16)) AS t(x)) AS b
+----
+1.0 1.0
+
+# All floating point types are summed as Float64
+query TT
+SELECT arrow_cast(sum(CAST(x AS FLOAT)), 'Utf8'), arrow_typeof(sum(CAST(x AS FLOAT)))
+FROM (VALUES (1.0), (1e16), (-1e16)) AS t(x)
+----
+1.0 Float64
+
+# No values
+query R
+SELECT sum(x) FROM (VALUES (CAST(NULL AS DOUBLE))) AS t(x)
+----
+NULL
+
+# Non-finite values
+query RRRR
+SELECT
+  sum(x) FILTER (WHERE x <> 'NaN' AND x <> '-Infinity'),
+  sum(x) FILTER (WHERE x <> 'NaN' AND x <> 'Infinity'),
+  sum(x) FILTER (WHERE x <> 'NaN'),
+  sum(x)
+FROM (VALUES (1.0), ('Infinity'), ('-Infinity'), ('NaN')) AS t(x)
+----
+Infinity -Infinity NaN NaN
+
+# Intermediate sums beyond the Float64 range do not overflow
+query TT
+SELECT
+  (SELECT arrow_cast(sum(x), 'Utf8') FROM (VALUES (1e308), (1e308), (-1e308)) AS t(x)) AS a,
+  (SELECT arrow_cast(sum(x), 'Utf8') FROM (VALUES (1e308), (-1e308), (1e308)) AS t(x)) AS b
+----
+1e308 1e308
+
+# The exact sum beyond the Float64 range overflows as addition does
+query R
+SELECT sum(x) FROM (VALUES (1.7976931348623157e308), (1.7976931348623157e308)) AS t(x)
+----
+Infinity
+
+# `sum(x + c)` is not rewritten to `sum(x) + c * count(x)`, which rounds
+# differently
+query TTT
+SELECT
+  arrow_cast(sum(x), 'Utf8'),
+  arrow_cast(sum(x + 1.0), 'Utf8'),
+  arrow_cast(sum(x + 2.0), 'Utf8')
+FROM (VALUES (1e16), (1.0), (-1e16)) AS t(x)
+----
+1.0 2.0 7.0
+
+# Distinct sums of different arguments are not rewritten to `GROUP BY`
+query TT
+SELECT arrow_cast(sum(DISTINCT x), 'Utf8'), arrow_cast(sum(DISTINCT -x), 'Utf8')
+FROM (VALUES (1e16), (1.0), (-1e16), (1.0), (1e16)) AS t(x)
+----
+1.0 -1.0
+
+# Sliding window frames add the values entering the frame and remove the
+# values leaving it, including non-finite ones
+statement ok
+CREATE TABLE w (i INT, x DOUBLE) AS VALUES
+  (0, 1e16), (1, 1.0), (2, -1e16), (3, 'Infinity'), (4, 2.0), (5, 'NaN'),
+  (6, 3.0), (7, '-Infinity'), (8, 1e308), (9, 1e308), (10, -1e308), (11, 4.0),
+  (12, 5.0), (13, 6.0)
+
+query IT
+SELECT i, arrow_cast(sum(x) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 'Utf8')
+FROM w ORDER BY i
+----
+0 1e16
+1 1e16
+2 1.0
+3 inf
+4 inf
+5 NaN
+6 NaN
+7 NaN
+8 -inf
+9 -inf
+10 1e308
+11 4.0
+12 -1e308
+13 15.0
+
+statement ok
+DROP TABLE w
+
+# Other types are not affected
+query IIRTTT
+SELECT
+  sum(i), sum(u), sum(d),
+  arrow_typeof(sum(i)), arrow_typeof(sum(u)), arrow_typeof(sum(d))
+FROM (VALUES
+  (1, CAST(1 AS INT UNSIGNED), CAST(1.25 AS DECIMAL(10, 2))),
+  (2, CAST(2 AS INT UNSIGNED), CAST(2.50 AS DECIMAL(10, 2)))
+) AS t(i, u, d)
+----
+3 3 3.75 Int64 UInt64 Decimal128(20, 2)
+
+# The same values summed in different orders, partitions and batches give
+# the same sums. Mixed signs and magnitudes spanning 20 orders make plain
+# floating point summation highly order-dependent.
+statement ok
+CREATE TABLE t AS
+SELECT
+  v % 100 AS g,
+  CASE WHEN v % 10 = 0 THEN NULL
+       ELSE (((v * 7919) % 1000) - 500) / 7.0 * power(10.0, ((v * 104729) % 21) - 10)
+  END AS x
+FROM generate_series(1, 100000) AS s(v)
+
+statement ok
+CREATE TABLE t_ascending AS SELECT * FROM t ORDER BY x
+
+statement ok
+CREATE TABLE t_descending AS SELECT * FROM t ORDER BY x DESC
+
+query I
+COPY t TO 'test_files/scratch/sum_float/t.parquet'
+STORED AS PARQUET OPTIONS ('format.max_row_group_size' '1000')
+----
+100000
+
+statement ok
+CREATE EXTERNAL TABLE t_parquet STORED AS PARQUET
+LOCATION 'test_files/scratch/sum_float/t.parquet'
+
+# `sum(DISTINCT x)` alone would be rewritten to a plain `sum` over
+# `GROUP BY x`; with `sum(DISTINCT -x)` it is not
+statement ok
+CREATE TABLE sums AS
+SELECT sum(x) AS s, sum(DISTINCT x) AS d, sum(DISTINCT -x) AS n FROM t
+
+query I
+INSERT INTO sums SELECT sum(x), sum(DISTINCT x), sum(DISTINCT -x) FROM t_ascending
+----
+1
+
+query I
+INSERT INTO sums SELECT sum(x), sum(DISTINCT x), sum(DISTINCT -x) FROM t_descending
+----
+1
+
+query I
+INSERT INTO sums
+SELECT sum(x), sum(DISTINCT x), sum(DISTINCT -x)
+FROM (SELECT x FROM t WHERE x > 0 UNION ALL SELECT x FROM t WHERE x <= 0)
+----
+1
+
+statement ok
+SET datafusion.execution.target_partitions = 1
+
+query I
+INSERT INTO sums SELECT sum(x), sum(DISTINCT x), sum(DISTINCT -x) FROM t_parquet
+----
+1
+
+statement ok
+SET datafusion.execution.target_partitions = 7
+
+statement ok
+SET datafusion.execution.batch_size = 13
+
+query I
+INSERT INTO sums SELECT sum(x), sum(DISTINCT x), sum(DISTINCT -x) FROM t_parquet
+----
+1
+
+statement ok
+RESET datafusion.execution.batch_size
+
+statement ok
+SET datafusion.execution.target_partitions = 4
+
+query IIII
+SELECT count(*), count(DISTINCT s), count(DISTINCT d), count(DISTINCT n) FROM sums
+----
+6 1 1 1
+
+# `GROUP BY`, with and without partial aggregation
+statement ok
+CREATE TABLE group_sums AS SELECT g, sum(x) AS s FROM t GROUP BY g
+
+statement ok
+SET datafusion.execution.skip_partial_aggregation_probe_rows_threshold = 0
+
+statement ok
+SET datafusion.execution.skip_partial_aggregation_probe_ratio_threshold = 0.0
+
+query I
+INSERT INTO group_sums SELECT g, sum(x) FROM t_descending GROUP BY g
+----
+100
+
+statement ok
+RESET datafusion.execution.skip_partial_aggregation_probe_rows_threshold
+
+statement ok
+RESET datafusion.execution.skip_partial_aggregation_probe_ratio_threshold
+
+query I
+INSERT INTO group_sums SELECT g, sum(x) FROM t_parquet GROUP BY g
+----
+100
+
+query I
+SELECT count(*) FROM group_sums
+----
+300
+
+query I
+SELECT count(*) FROM (SELECT g FROM group_sums GROUP BY g HAVING count(DISTINCT s) > 1)
+----
+0
+
+# Each group sum equals the sum of the group computed separately
+query I
+SELECT count(*) FROM group_sums
+WHERE s <> (SELECT sum(x) FROM t WHERE t.g = group_sums.g)
+----
+0
+
+statement ok
+DROP TABLE group_sums
+
+statement ok
+DROP TABLE sums
+
+statement ok
+DROP TABLE t_parquet
+
+statement ok
+DROP TABLE t_descending
+
+statement ok
+DROP TABLE t_ascending
+
+statement ok
+DROP TABLE t
