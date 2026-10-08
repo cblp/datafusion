@@ -32,6 +32,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::ExplainFormat;
 use datafusion::prelude::SessionContext;
 use datafusion_cli::catalog::DynamicObjectStoreCatalog;
+use datafusion_cli::det_sum::det_sum;
 use datafusion_cli::functions::{
     ListFilesCacheFunc, MetadataCacheFunc, ParquetFileMetadataFunc, ParquetMetadataFunc,
     ParquetPageIndexFunc, StatisticsCacheFunc,
@@ -303,6 +304,8 @@ async fn main_inner() -> Result<()> {
             ctx.task_ctx().runtime_env().cache_manager.clone(),
         )),
     );
+
+    ctx.register_udaf(det_sum());
 
     let mut print_options = PrintOptions {
         format: args.format,
