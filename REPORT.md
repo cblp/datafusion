@@ -41,8 +41,8 @@
 ```sql
 -- 1 млн чисел разных знаков, величины от 1 до 1e20
 CREATE TABLE t AS
-SELECT (random() - 0.5) * pow(10, random() * 20) AS x
-FROM generate_series(1, 1000000);
+    SELECT (random() - 0.5) * pow(10, random() * 20) AS x
+    FROM generate_series(1, 1000000);
 
 -- те же числа, перемешанные
 CREATE TABLE t_shuffled AS SELECT x FROM t ORDER BY random();
@@ -80,9 +80,55 @@ SELECT sum(x), det_sum(x) FROM (VALUES (0.1), (0.2), (0.3)) AS v(x); -- 0.600000
 
 Перемешивание в подзапросе
 (`SELECT sum(x) FROM (SELECT x FROM t ORDER BY random())`) для демонстрации не
-подходит: оптимизатор выбрасывает сортировку под агрегатом. Изменение
-`datafusion.execution.target_partitions` после создания таблицы тоже ничего не
-меняет: таблица разбивается на партиции при создании.
+подходит: оптимизатор выбрасывает сортировку под агрегатом.
+
+### Разное число партиций
+
+Таблица в памяти (`CREATE TABLE ... AS`) получает партиции по числу ядер
+независимо от `datafusion.execution.target_partitions`, и при запросах эта
+настройка на неё не влияет. Parquet-файл с мелкими row group'ами DataFusion при
+каждом запросе делит между `target_partitions` партициями:
+
+```sql
+-- row group по 10 000 строк, чтобы файл можно было делить между партициями
+COPY (
+    SELECT (random() - 0.5) * pow(10, random() * 20) AS x
+    FROM generate_series(1, 1000000)
+) TO '/tmp/t.parquet'
+    STORED AS PARQUET
+    OPTIONS ('format.max_row_group_size' '10000');
+CREATE EXTERNAL TABLE tp STORED AS PARQUET LOCATION '/tmp/t.parquet';
+
+SET datafusion.execution.target_partitions = 1;
+SELECT sum(x), det_sum(x) FROM tp;
+
+SET datafusion.execution.target_partitions = 2;
+SELECT sum(x), det_sum(x) FROM tp;
+
+SET datafusion.execution.target_partitions = 4;
+SELECT sum(x), det_sum(x) FROM tp;
+
+SET datafusion.execution.target_partitions = 12;
+SELECT sum(x), det_sum(x) FROM tp;
+SELECT sum(x), det_sum(x) FROM tp; -- тот же запрос ещё раз
+```
+
+Результат одного прогона (число групп файлов 1, 2 и 12 подтверждено
+`EXPLAIN`):
+
+| партиций   | `sum(x)`              | `det_sum(x)`          |
+| ---------- | --------------------- | --------------------- |
+| 1          | 4.0847401267492526e21 | 4.0847401267492553e21 |
+| 2          | 4.0847401267492516e21 | 4.0847401267492553e21 |
+| 4          | 4.084740126749252e21  | 4.0847401267492553e21 |
+| 12         | 4.084740126749253e21  | 4.0847401267492553e21 |
+| 12, повтор | 4.0847401267492526e21 | 4.0847401267492553e21 |
+
+При 12 партициях `sum` меняется даже при повторе того же запроса: частичные
+суммы партиций приходят на финальную стадию в порядке, который зависит от
+планирования потоков, и складываются в этом порядке. То же видно на таблице в
+памяти: повторяя `SELECT sum(x), det_sum(x) FROM t`, можно получить разные
+значения `sum`.
 
 ## Производительность
 
