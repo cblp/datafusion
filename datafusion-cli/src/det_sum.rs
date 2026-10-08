@@ -1,8 +1,9 @@
-//! `det_sum`: a deterministic floating point sum.
+//! `sum` with deterministic floating point summation.
 //!
-//! Floating point addition is not associative, so the result of `sum` depends
-//! on how rows are split into partitions and batches. `det_sum` instead
-//! computes the exact sum and rounds it once, using [`bitrep::SumF64`]:
+//! Floating point addition is not associative, so the result of the built-in
+//! `sum` depends on how rows are split into partitions and batches. For
+//! floating point input, [`det_sum`] instead computes the exact sum and rounds
+//! it once, using [`bitrep::SumF64`]:
 //!
 //! 1. Every finite `f64` is an integer multiple of 2⁻¹⁰⁷⁴, the smallest
 //!    subnormal. It is converted to that integer, stored in a 2176-bit two's
@@ -19,76 +20,154 @@ use {
     bitrep::SumF64,
     datafusion::{
         arrow::{
-            array::{Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array},
-            datatypes::{DataType, Field, FieldRef},
+            array::{
+                Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array,
+                ListArray,
+            },
+            datatypes::{DataType, Field, FieldRef, Float64Type},
         },
         common::{
             Result, ScalarValue,
-            cast::{as_fixed_size_binary_array, as_float64_array},
+            cast::{as_fixed_size_binary_array, as_float64_array, as_list_array},
             internal_err,
         },
+        functions_aggregate::sum::Sum,
         logical_expr::{
-            Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator,
-            Signature, Volatility,
+            Accumulator, AggregateUDF, AggregateUDFImpl, Documentation, EmitTo, Expr,
+            GroupsAccumulator, Operator, ReversedUDAF, SetMonotonicity, Signature,
+            StatisticsArgs,
+            expr::AggregateFunction,
             function::{AccumulatorArgs, StateFieldsArgs},
+            utils::{AggregateOrderSensitivity, format_state_name},
         },
     },
-    std::sync::{Arc, LazyLock},
+    std::{collections::HashSet, sync::Arc},
 };
 
-/// The exact sum of the input rounded to the nearest `f64`, so it does not
-/// depend on the summation order.
+/// The built-in `sum`, except that floating point input is summed exactly and
+/// rounded once, so the result does not depend on the summation order.
 pub fn det_sum() -> AggregateUDF {
-    AggregateUDF::from(DetSumUDAF)
+    AggregateUDF::from(DetSumUDAF::default())
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct DetSumUDAF;
+/// Delegates to the built-in [`Sum`] unless the input is `Float64`, to which
+/// `sum` coerces all floating point types.
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
+struct DetSumUDAF {
+    builtin: Sum,
+}
 
-static SIGNATURE: LazyLock<Signature> =
-    LazyLock::new(|| Signature::exact(vec![DataType::Float64], Volatility::Immutable));
+fn sums_floats(args: &AccumulatorArgs) -> bool {
+    args.return_field.data_type() == &DataType::Float64
+}
 
 /// The state is [`SumF64::to_bytes`].
 const STATE_BYTES: i32 = SumF64::BYTES as i32;
 
 impl AggregateUDFImpl for DetSumUDAF {
     fn name(&self) -> &str {
-        "det_sum"
+        self.builtin.name()
     }
 
     fn signature(&self) -> &Signature {
-        &SIGNATURE
+        self.builtin.signature()
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Float64)
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        self.builtin.return_type(arg_types)
     }
 
-    fn state_fields(&self, _args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        Ok(vec![
-            Field::new("sum", DataType::FixedSizeBinary(STATE_BYTES), true).into(),
-        ])
+    /// `DISTINCT` keeps the built-in state, a list of the distinct values.
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        if args.return_type() == &DataType::Float64 && !args.is_distinct {
+            let name = format_state_name(args.name, "sum");
+            Ok(vec![
+                Field::new(name, DataType::FixedSizeBinary(STATE_BYTES), true).into(),
+            ])
+        } else {
+            self.builtin.state_fields(args)
+        }
     }
 
-    fn accumulator(&self, _args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        Ok(Box::new(DetSumAccumulator::default()))
+    fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        match (sums_floats(&args), args.is_distinct) {
+            (true, false) => Ok(Box::new(DetSumAccumulator::default())),
+            (true, true) => Ok(Box::new(DistinctDetSumAccumulator::default())),
+            (false, _) => self.builtin.accumulator(args),
+        }
     }
 
-    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
-        true
+    fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
+        self.builtin.groups_accumulator_supported(args)
     }
 
     fn create_groups_accumulator(
         &self,
-        _args: AccumulatorArgs,
+        args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
-        Ok(Box::new(DetSumGroupsAccumulator::default()))
+        if sums_floats(&args) {
+            Ok(Box::new(DetSumGroupsAccumulator::default()))
+        } else {
+            self.builtin.create_groups_accumulator(args)
+        }
+    }
+
+    fn create_sliding_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn Accumulator>> {
+        if sums_floats(&args) && !args.is_distinct {
+            Ok(Box::new(SlidingDetSumAccumulator::default()))
+        } else {
+            self.builtin.create_sliding_accumulator(args)
+        }
+    }
+
+    fn reverse_expr(&self) -> ReversedUDAF {
+        self.builtin.reverse_expr()
+    }
+
+    fn order_sensitivity(&self) -> AggregateOrderSensitivity {
+        self.builtin.order_sensitivity()
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        self.builtin.documentation()
+    }
+
+    fn set_monotonicity(&self, data_type: &DataType) -> SetMonotonicity {
+        self.builtin.set_monotonicity(data_type)
+    }
+
+    /// The built-in rewrite of `sum(x + c)` to `sum(x) + c * count(x)` rounds
+    /// differently from the exact sum of `x + c`.
+    fn simplify_expr_op_literal(
+        &self,
+        agg_function: &AggregateFunction,
+        arg: &Expr,
+        op: Operator,
+        lit: &Expr,
+        arg_is_left: bool,
+    ) -> Result<Option<Expr>> {
+        if matches!(lit, Expr::Literal(value, _) if value.data_type().is_floating()) {
+            return Ok(None);
+        }
+        self.builtin
+            .simplify_expr_op_literal(agg_function, arg, op, lit, arg_is_left)
+    }
+
+    /// Floating point sums in statistics are not computed exactly.
+    fn value_from_stats(&self, args: &StatisticsArgs) -> Option<ScalarValue> {
+        if args.return_type == &DataType::Float64 {
+            return None;
+        }
+        self.builtin.value_from_stats(args)
     }
 }
 
 fn decode_state(bytes: &[u8]) -> Result<SumF64> {
     let Some(sum) = bytes.try_into().ok().and_then(SumF64::from_bytes) else {
-        return internal_err!("invalid det_sum state");
+        return internal_err!("invalid sum state");
     };
     Ok(sum)
 }
@@ -98,7 +177,7 @@ fn encode_states<'a>(sums: impl IntoIterator<Item = &'a SumF64>) -> ArrayRef {
     Arc::new(FixedSizeBinaryArray::new(STATE_BYTES, bytes.into(), None))
 }
 
-/// `det_sum` of no values is NULL, as for `sum`.
+/// `sum` of no values is NULL.
 fn result(sum: &SumF64) -> Option<f64> {
     (sum.count() > 0).then(|| sum.value())
 }
@@ -131,6 +210,125 @@ impl Accumulator for DetSumAccumulator {
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
         Ok(ScalarValue::Float64(result(&self.sum)))
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self)
+    }
+}
+
+/// `sum(DISTINCT x)`. The built-in one adds up a hash set in its iteration
+/// order, which varies between runs.
+#[derive(Debug, Default)]
+struct DistinctDetSumAccumulator {
+    /// Bit patterns of the distinct values.
+    values: HashSet<u64>,
+}
+
+impl Accumulator for DistinctDetSumAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let values = as_float64_array(&values[0])?;
+        self.values
+            .extend(values.iter().flatten().map(f64::to_bits));
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        for values in as_list_array(&states[0])?.iter().flatten() {
+            self.update_batch(&[values])?;
+        }
+        Ok(())
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let values = self.values.iter().map(|&bits| Some(f64::from_bits(bits)));
+        let list = ListArray::from_iter_primitive::<Float64Type, _, _>([Some(values)]);
+        Ok(vec![ScalarValue::List(Arc::new(list))])
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let sum: SumF64 = self.values.iter().copied().map(f64::from_bits).collect();
+        Ok(ScalarValue::Float64(result(&sum)))
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self) + self.values.capacity() * size_of::<u64>()
+    }
+}
+
+/// `sum` over sliding window frames, which removes values leaving the frame.
+/// Removing a finite value from a [`SumF64`] is exact, but its flags for NaN
+/// and infinities cannot be cleared, so non-finite values are counted here.
+#[derive(Debug, Default)]
+struct SlidingDetSumAccumulator {
+    finite_sum: SumF64,
+    count: u64,
+    nan_count: u64,
+    pos_inf_count: u64,
+    neg_inf_count: u64,
+}
+
+impl SlidingDetSumAccumulator {
+    fn non_finite_count(&mut self, x: f64) -> Option<&mut u64> {
+        if x.is_nan() {
+            Some(&mut self.nan_count)
+        } else if x == f64::INFINITY {
+            Some(&mut self.pos_inf_count)
+        } else if x == f64::NEG_INFINITY {
+            Some(&mut self.neg_inf_count)
+        } else {
+            None
+        }
+    }
+}
+
+impl Accumulator for SlidingDetSumAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        for x in as_float64_array(&values[0])?.iter().flatten() {
+            self.count += 1;
+            match self.non_finite_count(x) {
+                Some(count) => *count += 1,
+                None => self.finite_sum.add(x),
+            }
+        }
+        Ok(())
+    }
+
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        for x in as_float64_array(&values[0])?.iter().flatten() {
+            self.count -= 1;
+            match self.non_finite_count(x) {
+                Some(count) => *count -= 1,
+                None => self.finite_sum.add(-x),
+            }
+        }
+        Ok(())
+    }
+
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+
+    fn merge_batch(&mut self, _states: &[ArrayRef]) -> Result<()> {
+        internal_err!("sliding sum is evaluated in a single partition")
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        internal_err!("sliding sum is evaluated in a single partition")
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let sum =
+            if self.nan_count > 0 || (self.pos_inf_count > 0 && self.neg_inf_count > 0) {
+                f64::NAN
+            } else if self.pos_inf_count > 0 {
+                f64::INFINITY
+            } else if self.neg_inf_count > 0 {
+                f64::NEG_INFINITY
+            } else {
+                self.finite_sum.value()
+            };
+        Ok(ScalarValue::Float64((self.count > 0).then_some(sum)))
     }
 
     fn size(&self) -> usize {
@@ -221,8 +419,12 @@ mod tests {
     use {
         super::*,
         datafusion::{
-            arrow::record_batch::RecordBatch, common::cast::as_int64_array,
-            datasource::MemTable, prelude::*,
+            arrow::{array::Int64Array, record_batch::RecordBatch},
+            common::cast::as_int64_array,
+            datasource::MemTable,
+            execution::FunctionRegistry,
+            functions_aggregate::expr_fn::{count, sum},
+            prelude::*,
         },
         std::collections::BTreeMap,
     };
@@ -349,25 +551,30 @@ mod tests {
     async fn det_sum_approximately_equals_sum_on_random_data() -> Result<()> {
         let config = SessionConfig::new().with_target_partitions(4);
         let ctx = SessionContext::new_with_config(config);
-        ctx.register_udaf(det_sum());
 
         // Same-sign values make `Σ|x|` equal to `|sum|`, so the tolerance
         // stays relative to the result instead of growing with cancellation.
         let batches = ctx
             .sql(
-                "WITH t AS (
-                    SELECT
-                        CASE WHEN random() < 0.1 THEN
-                            NULL
-                        ELSE
-                            random() * 1e6
-                        END
-                        AS x
-                    FROM generate_series(1, 100000)
-                )
-                SELECT sum(x), det_sum(x), count(x), sum(abs(x)) FROM t",
+                "SELECT
+                    CASE WHEN random() < 0.1 THEN
+                        NULL
+                    ELSE
+                        random() * 1e6
+                    END
+                    AS x
+                FROM generate_series(1, 100000)",
             )
             .await?
+            .aggregate(
+                vec![],
+                vec![
+                    sum(col("x")).alias("builtin"),
+                    det_sum().call(vec![col("x")]).alias("deterministic"),
+                    count(col("x")),
+                    sum(abs(col("x"))),
+                ],
+            )?
             .collect()
             .await?;
 
@@ -479,7 +686,7 @@ mod tests {
 
             let batches = ctx
                 .sql(
-                    "SELECT g, det_sum(x), det_sum(x) FILTER (WHERE x > 0)
+                    "SELECT g, sum(x), sum(x) FILTER (WHERE x > 0)
                     FROM t GROUP BY g ORDER BY g",
                 )
                 .await?
@@ -504,13 +711,13 @@ mod tests {
         Ok(())
     }
 
-    /// Runs `det_sum` over `data` shuffled, cut into batches of `batch_size`
-    /// rows and spread over `partitions` partitions.
+    /// Runs `sum` with and without `DISTINCT` over `data` shuffled, cut into
+    /// batches of `batch_size` rows and spread over `partitions` partitions.
     async fn shuffled_det_sum(
         data: &[RecordBatch],
         partitions: usize,
         batch_size: usize,
-    ) -> Result<ScalarValue> {
+    ) -> Result<Vec<ScalarValue>> {
         let config = SessionConfig::new()
             .with_target_partitions(partitions)
             .with_batch_size(batch_size);
@@ -538,11 +745,18 @@ mod tests {
         )?;
 
         let result = ctx
-            .sql("SELECT det_sum(x) FROM shuffled")
+            .sql(
+                "SELECT sum(x), sum(DISTINCT x), sum(DISTINCT -x), count(DISTINCT x)
+                FROM shuffled",
+            )
             .await?
             .collect()
             .await?;
-        ScalarValue::try_from_array(result[0].column(0), 0)
+        result[0]
+            .columns()
+            .iter()
+            .map(|column| ScalarValue::try_from_array(column, 0))
+            .collect()
     }
 
     #[tokio::test]
@@ -572,6 +786,139 @@ mod tests {
                 "partitions = {partitions}, batch_size = {batch_size}"
             );
         }
+        Ok(())
+    }
+
+    /// Runs `sql` with the built-in `sum` and with [`det_sum`].
+    async fn builtin_and_det_sum(
+        sql: &str,
+    ) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+        let builtin = SessionContext::new().sql(sql).await?.collect().await?;
+        let ctx = SessionContext::new();
+        ctx.register_udaf(det_sum());
+        let deterministic = ctx.sql(sql).await?.collect().await?;
+        Ok((builtin, deterministic))
+    }
+
+    #[tokio::test]
+    async fn replaces_builtin_sum() -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.register_udaf(det_sum());
+        assert_eq!(*ctx.udaf("sum")?, det_sum());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sums_other_types_as_builtin() -> Result<()> {
+        let sql = "SELECT
+                sum(i), sum(DISTINCT i), sum(u), sum(d),
+                arrow_typeof(sum(i)), arrow_typeof(sum(u)), arrow_typeof(sum(d))
+            FROM (VALUES
+                (1, CAST(1 AS INT UNSIGNED), CAST(1.25 AS DECIMAL(10, 2))),
+                (1, CAST(2 AS INT UNSIGNED), CAST(2.50 AS DECIMAL(10, 2))),
+                (3, CAST(3 AS INT UNSIGNED), CAST(3.75 AS DECIMAL(10, 2)))
+            ) AS t(i, u, d)";
+        let (builtin, deterministic) = builtin_and_det_sum(sql).await?;
+        assert_eq!(builtin, deterministic);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sums_all_float_types() -> Result<()> {
+        // DataFusion rejects `sum(x)` and `sum(CAST(x AS FLOAT))` in one query
+        // as duplicate names, even with aliases.
+        for x in ["x", "CAST(x AS FLOAT)"] {
+            let sql =
+                format!("SELECT sum({x}) FROM (VALUES (1.0), (1e16), (-1e16)) AS t(x)");
+            let (_, deterministic) = builtin_and_det_sum(&sql).await?;
+            assert_eq!(
+                as_float64_array(deterministic[0].column(0))?.value(0),
+                1.0,
+                "{x}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A single `sum(DISTINCT x)` is rewritten to a plain `sum` over
+    /// `GROUP BY x`; distinct sums of different arguments are not.
+    #[tokio::test]
+    async fn distinct_sum_is_exact() -> Result<()> {
+        let sql = "SELECT sum(DISTINCT x), sum(DISTINCT -x)
+            FROM (VALUES (1e16), (1.0), (-1e16), (1.0), (1e16)) AS t(x)";
+        let (_, deterministic) = builtin_and_det_sum(sql).await?;
+        assert_eq!(as_float64_array(deterministic[0].column(0))?.value(0), 1.0);
+        assert_eq!(as_float64_array(deterministic[0].column(1))?.value(0), -1.0);
+        Ok(())
+    }
+
+    /// The built-in rewrite of `sum(x + c)` to `sum(x) + c * count(x)` would
+    /// round differently.
+    #[tokio::test]
+    async fn sum_of_x_plus_literal_is_exact() -> Result<()> {
+        let values = [1e16, 1.0, -1e16];
+        let sql = "SELECT sum(x), sum(x + 1.0), sum(x + 2.0)
+            FROM (VALUES (1e16), (1.0), (-1e16)) AS t(x)";
+        let (_, deterministic) = builtin_and_det_sum(sql).await?;
+        for (column, c) in deterministic[0].columns().iter().zip([0.0, 1.0, 2.0]) {
+            let expected = exact_sum(&values.map(|x| x + c))?;
+            assert_eq!(as_float64_array(column)?.value(0), expected, "c = {c}");
+        }
+        Ok(())
+    }
+
+    /// Sliding frames add values entering the frame and remove values leaving
+    /// it; the result must still be the exact sum of the frame.
+    #[tokio::test]
+    async fn window_frames_are_summed_exactly() -> Result<()> {
+        let values = [
+            1e16,
+            1.0,
+            -1e16,
+            f64::INFINITY,
+            2.0,
+            f64::NAN,
+            3.0,
+            f64::NEG_INFINITY,
+            1e308,
+            1e308,
+            -1e308,
+            4.0,
+            5.0,
+            6.0,
+        ];
+        let batch = RecordBatch::try_from_iter([
+            (
+                "i",
+                Arc::new(Int64Array::from_iter_values(0..values.len() as i64))
+                    as ArrayRef,
+            ),
+            (
+                "x",
+                Arc::new(Float64Array::from(values.to_vec())) as ArrayRef,
+            ),
+        ])?;
+        let ctx = SessionContext::new();
+        ctx.register_udaf(det_sum());
+        ctx.register_batch("t", batch)?;
+
+        let batches = ctx
+            .sql(
+                "SELECT sum(x) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+                FROM t ORDER BY i",
+            )
+            .await?
+            .collect()
+            .await?;
+        let actual: Vec<u64> = as_float64_array(batches[0].column(0))?
+            .values()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        let expected = (0..values.len())
+            .map(|i| Ok(exact_sum(&values[i.saturating_sub(2)..=i])?.to_bits()))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(actual, expected);
         Ok(())
     }
 }
