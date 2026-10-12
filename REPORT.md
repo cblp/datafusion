@@ -97,10 +97,11 @@ SELECT sum(x) FROM (VALUES (0.1), (0.2), (0.3)) AS v(x); -- 0.6 (обычное 
 
 ### Разное число партиций
 
-Таблица в памяти (`CREATE TABLE ... AS`) получает партиции по числу ядер
-независимо от `datafusion.execution.target_partitions`, и при запросах эта
-настройка на неё не влияет. Parquet-файл с мелкими row group'ами DataFusion при
-каждом запросе делит между `target_partitions` партициями:
+Таблица в памяти (`CREATE TABLE ... AS`) делится на партиции один раз, при
+создании, по значению `datafusion.execution.target_partitions` в этот момент;
+последующие изменения настройки на неё не влияют. Parquet-файл с мелкими row
+group'ами DataFusion делит между `target_partitions` партициями при каждом
+запросе:
 
 ```sql
 -- row group по 10 000 строк, чтобы файл можно было делить между партициями
