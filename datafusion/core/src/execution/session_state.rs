@@ -1726,7 +1726,8 @@ impl SessionStateBuilder {
             #[cfg(feature = "sql")]
             type_planner,
             optimizer: optimizer.unwrap_or_default(),
-            physical_optimizers: physical_optimizers.unwrap_or_default(),
+            physical_optimizers: physical_optimizers
+                .unwrap_or_else(default_physical_optimizer),
             query_planner: query_planner
                 .unwrap_or_else(|| Arc::new(DefaultQueryPlanner {})),
             catalog_list: catalog_list.unwrap_or_else(|| {
@@ -2543,6 +2544,27 @@ pub trait CacheFactory: Debug + Send + Sync {
         plan: LogicalPlan,
         session_state: &SessionState,
     ) -> datafusion_common::Result<LogicalPlan>;
+}
+
+/// The default physical optimizer, plus rules that depend on optional crates.
+fn default_physical_optimizer() -> PhysicalOptimizer {
+    #[cfg_attr(not(feature = "parquet"), expect(unused_mut))]
+    let mut optimizer = PhysicalOptimizer::new();
+    #[cfg(feature = "parquet")]
+    {
+        use crate::datasource::physical_plan::parquet::late_materialization::ParquetLateMaterialization;
+        // Must run before `FilterPushdown(Post)` so that the TopK dynamic
+        // filter reaches the narrow scan it creates.
+        let position = optimizer
+            .rules
+            .iter()
+            .position(|rule| rule.name() == "FilterPushdown(Post)")
+            .unwrap_or(optimizer.rules.len());
+        optimizer
+            .rules
+            .insert(position, Arc::new(ParquetLateMaterialization::new()));
+    }
+    optimizer
 }
 
 #[cfg(test)]

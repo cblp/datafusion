@@ -1682,6 +1682,16 @@ config_namespace! {
         /// into the file scan phase.
         pub enable_topk_dynamic_filter_pushdown: bool, default = true
 
+        /// When set to true, a TopK (`ORDER BY ... LIMIT n`) over a single
+        /// Parquet file reads only the sort and filter columns plus the file
+        /// row index, and then fetches the remaining columns for the `n`
+        /// winning rows only (late materialization).
+        pub enable_parquet_late_materialization: bool, default = false
+
+        /// The largest `LIMIT` for which `enable_parquet_late_materialization`
+        /// rewrites a TopK.
+        pub late_materialization_max_rows: usize, default = 100
+
         /// When set to true, uncorrelated scalar subqueries are
         /// left in the logical plan and executed by `ScalarSubqueryExec` during
         /// physical execution. When set to false, all scalar subqueries

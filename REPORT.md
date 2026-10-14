@@ -1,0 +1,476 @@
+# Поздняя материализация в DataFusion: TopK по широким таблицам
+
+Даты: 2026-10-12 — 2026-10-14. База: `main` @ `6663e4348`, arrow/parquet 60.0.0.
+Прототип: ветка `late-materialization-prototype`.
+
+Сравнение: datafusion-cli 55.2.0 (brew), main (release, mimalloc), DuckDB v1.5.6
+(brew).
+
+Машина: MacBook, 8 P + 4 E ядер, 24 ГБ; `target_partitions=8`, DuckDB
+`threads=8`.
+
+Данные: ClickBench `hits.parquet` (14,78 ГБ, 100 млн строк, 105 колонок, 226 row
+group по ~450 тыс. строк, SNAPPY, parquet-cpp 1.5.1, **без offset index и column
+index**).
+
+## 1. Гипотеза и итог
+
+**Гипотеза.** DataFusion плохо справляется, когда части запроса (фильтр,
+сортировка с `LIMIT` и т. п.) затрагивают малую часть колонок, а на выход нужно
+протащить много колонок: все колонки декодируются для всех строк, проходящих
+через скан, хотя нужны только для строк результата.
+
+**Итог.**
+
+- **Для фильтров гипотеза подтвердилась только для настроек по умолчанию**, и
+  решение уже есть: `datafusion.execution.parquet.pushdown_filters=true`
+  декодирует широкие колонки только для прошедших строк (раздел 3). Оставшийся
+  разрыв с DuckDB на `SELECT *` — распаковка и чтение страниц, а не
+  декодирование лишних строк; поздняя материализация его не закрывает.
+- **Для TopK (`ORDER BY … LIMIT n`) гипотеза подтвердилась.** Даже с pushdown
+  широкие колонки декодируются для сотен строк вместо `n`, а без pushdown —
+  почти для всех строк (раздел 4).
+- **Решение** — поздняя материализация по номеру строки, как оптимизатор
+  `LateMaterialization` в DuckDB: TopK по узкому скану (колонки сортировки и
+  фильтра + row id), затем дочитывание всех колонок только для `n` строк (раздел
+  5).
+- **Прототип** (раздел 6) на Q23: без pushdown 5,27 → **1,11 с** (×4,7), с
+  pushdown 0,38 → **0,28 с** (−26%, быстрее DuckDB — 0,32 с). На
+  `ORDER BY WatchID LIMIT 10` без pushdown main не уложился в 8 ГБ памяти, с
+  прототипом — 1,03 с (раздел 7).
+
+## 2. Методика
+
+- `EXPLAIN ANALYZE` — полное выполнение без печати результата.
+- Горячий кэш ОС, 3 раунда, варианты чередуются (A, B, C, A, B, C…), медиана.
+- Сравнивать числа можно только внутри одной серии: между сериями один и тот же
+  вариант гуляет (например, Q23 на main с pushdown — 0,38–0,50 с в разных
+  сериях).
+- Селективность: `URL LIKE '%google%'` — 15 911 строк (0,016%);
+  `URL LIKE '%.ru%'` — 69,4 млн (69%).
+- `pushdown` ниже — это `pushdown_filters` и `reorder_filters` одновременно; по
+  умолчанию оба выключены.
+
+## 3. Фильтры: что уже делает pushdown
+
+### 3.1. Замер
+
+Селективный фильтр `'%google%'`, секунды:
+
+| выход             | 55.2 off | 55.2 on   | main off | main on | DuckDB   |
+| ----------------- | -------- | --------- | -------- | ------- | -------- |
+| 1 колонка (`URL`) | 0.73     | 0.74      | 0.77     | 0.75    | 0.78     |
+| 4 колонки         | 2.24     | **1.12**  | 2.84     | 1.66    | 1.33     |
+| `*` (105 колонок) | 4.29     | 3.35–3.97 | 6.65     | 3.66    | **2.29** |
+
+off/on — pushdown выключен/включён.
+
+Неселективный фильтр `'%.ru%'`: все движки примерно равны (`*` ≈ 5 с, 4 колонки
+≈ 2,1–2,2 с), pushdown не проигрывает.
+
+- Без pushdown время растёт почти пропорционально объёму выходных колонок (0,73
+  → 4,3 с) — гипотеза для настроек по умолчанию верна.
+- С pushdown 4 колонки быстрее DuckDB; на `SELECT *` выигрыш лишь 10–20%, DuckDB
+  быстрее в 1,5 раза.
+
+### 3.2. Как работает pushdown
+
+`pushdown_filters=true` превращает предикат в arrow-rs `RowFilter`
+(`datafusion/datasource-parquet/src/row_filter.rs`). Для каждого row group
+arrow-rs:
+
+1. декодирует колонки предиката и вычисляет его → `RowSelection`
+   (`parquet/src/arrow/arrow_reader/read_plan.rs`, `with_predicate_options`);
+2. остальные колонки читает только для выбранных строк (`skip_records` /
+   `read_records`);
+3. страницу без выбранных строк пропускает без распаковки — даже без offset
+   index (`column/reader.rs`: `skip_records` → `peek_next_page` →
+   `skip_next_page`).
+
+Метрики подтверждают: на `SELECT * … '%google%'` декодировано 15,9 тыс. строк из
+100 млн (`pushdown_rows_pruned=99.98M`). Это и есть поздняя материализация на
+уровне скана — то же, что делает Parquet-ридер DuckDB со своим `SelectionVector`
+(`ParquetReader::Scan`: колонки фильтров сужают выборку, остальные читаются
+через `ColumnReader::Select`). Отличаются детали (гранулярность, адаптивный
+порядок фильтров), но не принцип.
+
+Тот же механизм уже частично решает и задачу TopK: динамический фильтр TopK
+(`EventTime < порог`) попадает в `RowFilter` рядом с `LIKE` (раздел 4).
+
+### 3.3. Почему на `SELECT *` остаётся разрыв с DuckDB
+
+Профиль main (`sample`, `SELECT * … '%google%'`, pushdown on), доли активного
+CPU:
+
+| на что                                          |    доля |
+| ----------------------------------------------- | ------: |
+| распаковка snappy (`snap::Decoder::decompress`) | **50%** |
+| системные вызовы ввода-вывода (`pread`, `open`) | **29%** |
+| декодирование parquet                           |      8% |
+| LIKE (`memchr`)                                 |      5% |
+| прочее                                          |      8% |
+
+`open` вызывает `object_store::LocalFileSystem::get_opts`: он открывает файл на
+каждый range-запрос.
+
+Выбор строк работает построчно, а распаковка и чтение — постранично. ~70
+совпадений на row group разбросаны по нему и задевают почти все страницы.
+Проверка на файле, переписанном с page index: `bytes_scanned` 14,45 → 9,97 ГБ —
+даже при идеальном пропуске страниц ~70% байт лежит в страницах с выбранными
+строками. Поэтому разрыв с DuckDB на этом запросе — вопрос распаковки и
+ввода-вывода (гипотеза: C++ snappy быстрее Rust-крейта `snap`; не проверено), а
+не поздней материализации.
+
+## 4. TopK: где pushdown не хватает
+
+Идеальный план для Q23
+(`SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`):
+декодировать `URL` для фильтра, `EventTime` для TopK, и только потом остальные
+~100 колонок — для 10 строк результата. Метрики `DataSourceExec` (55.2):
+
+|                                         | pushdown on | pushdown off |
+| --------------------------------------- | ----------- | ------------ |
+| строк, декодированных во всех колонках  | **256**     | 97,56 млн    |
+| row group, отсечённых динамич. фильтром | 182 из 226  | 5            |
+| `bytes_scanned`                         | 1,75 ГБ     | 14,3 ГБ      |
+| время                                   | 0,25 с      | 3,75 с       |
+
+Динамический фильтр TopK устроен так:
+
+1. `SortExec` с `fetch` (TopK) при планировании создаёт
+   `DynamicFilterPhysicalExpr` над ключами сортировки, изначально равный `true`
+   (`create_filter`, `physical-plan/src/sorts/sort.rs`). В `EXPLAIN` он виден
+   как `DynamicFilter [ empty ]`.
+2. Правило `FilterPushdown(Post)` в конце физической оптимизации передаёт этот
+   фильтр вниз по плану, в предикат скана (`ParquetSource`). Управляется
+   параметрами `enable_dynamic_filter_pushdown` и
+   `enable_topk_dynamic_filter_pushdown` (оба включены по умолчанию).
+3. Во время выполнения, как только в куче TopK набирается `n` строк, TopK
+   заменяет выражение на «строка лучше худшей в куче»: для `ORDER BY EventTime`
+   это `EventTime < порог` (`update_filter`, `physical-plan/src/topk/mod.rs`).
+   Фильтр один на весь `SortExec`, его разделяют все партиции и сужают по мере
+   нахождения лучших строк. `EXPLAIN ANALYZE` показывает последнее значение,
+   например `DynamicFilter [ EventTime@4 < 1372720043 ]`.
+
+Скан проверяет каждую строку по порогу, действующему в момент чтения:
+
+- **Pushdown off.** Динамический фильтр только отсекает row group по статистике;
+  внутри них все колонки декодируются для всех строк.
+- **Pushdown on.** Динамический фильтр попадает в `RowFilter`, и широкие колонки
+  декодируются только для строк, прошедших текущий порог: 256 вместо 10. Лишние
+  строки прошли, пока порог был ещё слабым: в начале скана куча пуста, а потом
+  порог сужается постепенно.
+
+Та же «первая фаза» без широких колонок (`SELECT "EventTime" …`): 0,106 с и 0,42
+ГБ с pushdown, 0,66 с и 2,91 ГБ без него. Значит, с pushdown около 0,15 с из
+0,25 и ~1,3 ГБ чтения уходит на широкие колонки для лишних строк, а без pushdown
+— почти всё время запроса.
+
+## 5. Идея решения
+
+### 5.1. Поздняя материализация по номеру строки
+
+Добавить в начале плана виртуальную колонку с исходным номером строки, вычислить
+TopK по узкому скану, а затем дочитать все колонки только для `n` найденных
+строк:
+
+```
+сортировка n строк по ключам TopK         -- восстановить порядок
+└── дочитать строки с row id ∈ {n штук}   -- все колонки, только n строк
+    └── TopK(n)
+        └── скан(колонки сортировки и фильтра, row id)
+```
+
+Так делает оптимизатор `LateMaterialization` DuckDB
+(`src/optimizer/late_materialization.cpp`): для Top-N / LIMIT / SAMPLE, когда
+корню нужно меньше колонок, чем отдаёт скан, план переписывается в semi-join по
+row id. Для Parquet row id = (`file_index`, `file_row_number`) — виртуальные
+колонки multi-file ридера. `EXPLAIN ANALYZE` DuckDB на Q23:
+
+```
+HASH_JOIN (SEMI)                                   -> 10 rows
+│   file_index = file_index
+│   AND file_row_number = file_row_number
+├── probe: READ_PARQUET (все 105 колонок)         -> 12 385 rows
+└── build: TOP_N (EventTime, 10)
+    └── READ_PARQUET (URL, EventTime, row id)
+          Filters: optional: Dynamic Filter (от TOP_N)
+```
+
+Полный скан выдал 12 385 строк, а не 10: судя по числу, фильтр от join'а
+работает как диапазон min/max row id (строки результата кучные — `EventTime`
+почти совпадает с порядком в файле), а не как точная выборка.
+
+### 5.2. Два варианта для DataFusion
+
+**Общий — через join.**
+
+```
+SortExec(EventTime, fetch=10)
+└── HashJoinExec(RightSemi, on = (file_id, row_idx))
+    ├── build: SortExec TopK(EventTime, fetch=10)
+    │   └── DataSourceExec(URL, EventTime, file_id, row_idx)
+    └── probe: DataSourceExec(все колонки, file_id, row_idx)
+          predicate: динамический фильтр join'а → RowSelection
+```
+
+Чего для него не хватает:
+
+1. Идентификатора файла (константная колонка на `PartitionedFile`). Номер строки
+   уже есть: `ParquetVirtualColumn::RowNumber`, SQL-функция `file_row_index()`.
+2. **Главное:** предикат по номеру строки должен становиться `RowSelection` и
+   отсечением row group, а не построчным `RowFilter`. Сейчас ссылаться на
+   виртуальные колонки в pushdown-предикатах запрещено
+   (`validate_predicate_does_not_reference_virtual_columns`, `opener/mod.rs`).
+3. Точный `IN`-список row id в динамическом фильтре `HashJoinExec` (сейчас —
+   диапазон).
+
+Плюс: тот же механизм подходит для `WHERE file_row_index() IN (…)`,
+delete-векторов и любых semi-join по row id.
+
+**Частный — специализированный оператор.** `ParquetFetchByRowIdExec` получает ≤
+n row id от TopK до открытия полного скана, сам строит по ним
+`ParquetAccessPlan` и восстанавливает порядок перестановкой. Это тот же
+semi-join, но без join'а и без динамического фильтра; выборка точная, а не по
+диапазону. Его и реализует прототип.
+
+## 6. Прототип `ParquetFetchByRowIdExec`
+
+### 6.1. Устройство
+
+`datafusion/datasource-parquet/src/late_materialization.rs`:
+
+- **Правило `ParquetLateMaterialization`** ищет цепочку операторов (сверху вниз)
+  `SortPreservingMergeExec(fetch)` (необязателен) → `SortExec(TopK)` → любое
+  число `FilterExec` и `RepartitionExec(RoundRobin)` → `DataSourceExec(parquet)`
+  над одним файлом и `n ≤ late_materialization_max_rows`. Узкий скан получает
+  колонки сортировки и фильтров плюс `file_row_index()` через обычный проброс
+  проекции (`try_swapping_with_projection`); фильтры, round-robin и TopK
+  пересобираются над ним с переназначенными индексами колонок.
+- **Оператор `ParquetFetchByRowIdExec`** собирает ≤ n row id, берёт метаданные
+  файла (из кэша метаданных — узкий скан их уже загрузил), строит
+  `ParquetAccessPlan` с `RowGroupAccess::Selection` только для нужных row group
+  и выполняет полный скан с этим планом как обычный `DataSourceExec`. Результат
+  переставляется в порядок TopK по row id.
+
+Правило встроено в список по умолчанию прямо перед `FilterPushdown(Post)`
+(`core/src/execution/session_state.rs`, `default_physical_optimizer`): так
+динамический фильтр нового TopK штатно доходит до узкого скана.
+
+План Q23 с прототипом:
+
+```
+ParquetFetchByRowIdExec: fetch=10, columns=105
+  SortPreservingMergeExec: [EventTime ASC NULLS LAST], fetch=10
+    SortExec: TopK(fetch=10), expr=[EventTime ASC NULLS LAST],
+              preserve_partitioning=[true]
+      DataSourceExec: projection=[EventTime, URL,
+                                  __late_materialization_row_index],
+                      predicate=URL LIKE %google%
+                                AND DynamicFilter [ EventTime < … ]
+```
+
+### 6.2. Параметры конфигурации
+
+Прототип добавляет два параметра в `datafusion.optimizer`
+(`datafusion/common/src/config.rs`, `OptimizerOptions`):
+
+| параметр                              | тип     | по умолчанию |
+| ------------------------------------- | ------- | ------------ |
+| `enable_parquet_late_materialization` | `bool`  | `false`      |
+| `late_materialization_max_rows`       | `usize` | `100`        |
+
+**`datafusion.optimizer.enable_parquet_late_materialization`** включает правило
+`ParquetLateMaterialization`. При `false` правило возвращает план без изменений,
+поэтому по умолчанию поведение DataFusion не меняется. При `true` правило
+переписывает каждый подходящий TopK (условия — в разделе 6.1, ограничения — в
+6.3); неподходящие планы остаются как есть.
+
+**`datafusion.optimizer.late_materialization_max_rows`** — наибольший `LIMIT n`,
+при котором TopK переписывается. Если `n` больше, план не меняется. Порог нужен,
+потому что дочитывание выгодно, пока строк мало: `ParquetFetchByRowIdExec`
+держит все `n` row id в памяти, а при большом `n` выбранные строки задевают
+почти все страницы, и дочитывание стоит почти как полный скан. Значение 100
+взято по аналогии с `late_materialization_max_rows` в DuckDB и не подбиралось
+замерами.
+
+Оба параметра читаются при физическом планировании, поэтому влияют на запросы,
+спланированные после их установки:
+
+```sql
+SET datafusion.optimizer.enable_parquet_late_materialization = true;
+SET datafusion.optimizer.late_materialization_max_rows = 50;
+```
+
+Как и остальные параметры, их можно задать переменными окружения (их читает,
+например, `datafusion-cli` при запуске) или через `SessionConfig`:
+
+```shell
+DATAFUSION_OPTIMIZER_ENABLE_PARQUET_LATE_MATERIALIZATION=true datafusion-cli
+```
+
+Связь с существующими параметрами:
+
+- `datafusion.execution.parquet.pushdown_filters` и `reorder_filters` —
+  независимы от прототипа, но определяют, насколько дёшев узкий скан: с ними
+  фильтр и динамический фильтр TopK применяются построчно внутри скана (раздел
+  7: Q23 — 0,28 с с ними и 1,11 с без них).
+- `datafusion.optimizer.enable_topk_dynamic_filter_pushdown` и
+  `enable_dynamic_filter_pushdown` — при их выключении узкий скан не получает
+  порог TopK. Результат остаётся верным, но скан читает больше.
+
+Оба новых параметра перечислены в `docs/source/user-guide/configs.md` и в
+`information_schema.slt`. Сборки без прототипа (например, 55.2) их не знают, и
+`SET` для них завершается ошибкой.
+
+### 6.3. Ограничения
+
+- Только один файл: номер строки уникален лишь внутри файла (нужен идентификатор
+  файла).
+- Без колонок партиций и без `ProjectionExec` между TopK и сканом.
+- Переписываются только запросы с `ORDER BY … LIMIT n`. Запросы с `LIMIT n` без
+  `ORDER BY` правило не трогает.
+- Дочитывание без offset index читает нужные column chunk целиком
+  (распаковываются только страницы с выбранными строками).
+
+### 6.4. Проверки
+
+- `datafusion/sqllogictest/test_files/parquet_late_materialization.slt`: план с
+  `ParquetFetchByRowIdExec`, совпадение результатов с правилом и без, пустой
+  результат, порог `late_materialization_max_rows`.
+- Вручную на сгенерированном файле (6 колонок, 6 row group): результаты с
+  правилом и без совпадают при pushdown on и off, включая сортировку по убыванию
+  по двум ключам.
+- `cargo clippy -D warnings` на затронутых крейтах чисто;
+  `information_schema.slt`, `explain.slt` и `docs/source/user-guide/configs.md`
+  обновлены.
+- Полный набор тестов не прогонялся: в чекауте не выгружены сабмодули `testing`,
+  `parquet-testing` и `datafusion-testing`, из-за них часть тестов падает и без
+  изменений.
+
+## 7. Результат: прототип против upstream
+
+main без правила (upstream) и main с правилом (LM), одна серия, 3 раунда,
+медиана, секунды:
+
+| запрос      | upstream     | LM       | upstream + pd | LM + pd  | DuckDB |
+| ----------- | ------------ | -------- | ------------- | -------- | ------ |
+| Q23         | 5.27         | **1.11** | 0.38          | **0.28** | 0.32   |
+| `.ru`       | 1.03         | **0.30** | 0.30          | **0.14** | 0.22   |
+| без фильтра | 0.44         | **0.15** | 0.25          | **0.20** | 0.15   |
+| `WatchID`   | > 8 ГБ, убит | **1.03** | 1.18          | **0.80** | 0.91   |
+
+pd — pushdown. Запросы (все — `SELECT * FROM hits`):
+
+- Q23 — `WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`;
+- `.ru` — `WHERE URL LIKE '%.ru%' ORDER BY EventTime LIMIT 10`;
+- без фильтра — `ORDER BY EventTime LIMIT 10`;
+- `WatchID` — `WHERE URL LIKE '%google%' ORDER BY WatchID LIMIT 10`.
+
+Метрики Q23:
+
+|                     | строк во всех колонках | `bytes_scanned` | время |
+| ------------------- | ---------------------- | --------------- | ----- |
+| upstream + pushdown | 258                    | 1,71 ГБ         | 0.38  |
+| LM + pushdown       | 10                     | 0,84 ГБ         | 0.28  |
+| LM без pushdown     | 10                     | 3,1 ГБ          | 1.11  |
+
+Для LM `bytes_scanned` — объём узкого скана.
+
+Выводы:
+
+- Без pushdown (по умолчанию) — ×3…×5 и никакого взрыва памяти.
+- С pushdown — −20…−50%; DataFusion с прототипом быстрее DuckDB на Q23,
+  `'%.ru%'` и `ORDER BY WatchID`. Без фильтра DuckDB быстрее (0,15 против 0,20
+  с); здесь лучший вариант DataFusion — прототип без pushdown (0,15 с, вровень с
+  DuckDB).
+- Без pushdown остаток (1,11 с) — узкий скан, который декодирует `URL` для 92,6
+  млн строк: без pushdown динамический фильтр TopK не может отсечь строки до
+  вычисления `LIKE`.
+
+## 8. Что дальше
+
+1. Идентификатор файла → снять ограничение «один файл» (ClickBench partitioned —
+   100 файлов).
+2. Поддержать в правиле `ProjectionExec` между TopK и сканом, а также запросы с
+   `LIMIT n` без `ORDER BY`.
+3. Вариант через semi-join: перевод предикатов по row id в `RowSelection`
+   (раздел 5.2).
+4. Решить, когда включать по умолчанию: порог по соотношению «колонок в выходе /
+   колонок для TopK» и по `n`.
+5. Выгрузить сабмодули и прогнать полный набор тестов из `CLAUDE.md`, а также
+   ClickBench целиком.
+6. Перед issue/PR — поиск существующих обсуждений в apache/datafusion (late
+   materialization, `file_row_index`, TopK).
+7. Перенести правило в стандартный список `PhysicalOptimizer::new()`. Сейчас
+   `ParquetLateMaterialization` вставляется в список правил сессии в `core`
+   (`default_physical_optimizer`, `session_state.rs`) перед
+   `FilterPushdown(Post)` и выключено флагом. Так сделано по двум причинам:
+
+   - правило должно работать до `FilterPushdown(Post)`, иначе динамический
+     фильтр нового TopK не дойдёт до узкого скана, а
+     `SessionStateBuilder::with_physical_optimizer_rule` добавляет правило
+     только в конец списка;
+   - включать его нужно через `SET` в `datafusion-cli` для замеров.
+
+   Общий список собирает крейт `datafusion-physical-optimizer`, который не
+   зависит от `datafusion-datasource-parquet`, поэтому вставка сделана в `core`
+   под `#[cfg(feature = "parquet")]`. Минусы:
+
+   - список правил сессии расходится с `PhysicalOptimizer::new()` и с
+     документированным порядком правил, а `EXPLAIN VERBOSE` показывает правило,
+     которого нет в документации;
+   - при замене списка через `with_physical_optimizer_rules` правило теряется;
+   - частный случай для Parquet в общем коде сборки сессии.
+
+   Для апстрима: сделать правило общим и поставить его в
+   `PhysicalOptimizer::new()`, а специфику Parquet спрятать за методом источника
+   данных (`DataSource` / `FileSource` сообщает, умеет ли он отдавать номер
+   строки и дочитывать строки по номерам). Тогда правило не зависит от
+   `datasource-parquet` и подходит другим форматам.
+
+## 9. Попутные находки
+
+- **Регрессия памяти в main.**
+  `SELECT * … WHERE URL LIKE '%google%' ORDER BY WatchID LIMIT 10`, pushdown
+  off: 55.2 — 4,1 с и пик 2,3 ГБ; main — 6,2 с и пик **16,8 ГБ**. Причина не
+  исследована; свежий подозреваемый — коммит #24105 (типизированный `StringHeap`
+  в TopK).
+- **Регрессия времени в main относительно 55.2** (воспроизведена с локальной
+  сборкой тега 55.2.0): `SELECT *` + `'%google%'` без pushdown +57%, Q23 без
+  pushdown +45–50%, с pushdown ×2. Кандидаты: arrow/parquet 59→60, #25731,
+  #25608, #25940. Бисекция не делалась.
+- **55.2.0, файл с page index, pushdown on:** Q23 падает в 2 из 3 прогонов с
+  `Parquet error: Invalid offset in sparse column chunk data` …
+  `no matching page found`. В main не воспроизвелось.
+- **По профилю `SELECT *`:** распаковка snappy — 50% CPU; `LocalFileSystem`
+  открывает файл на каждый range-запрос (`__open` ≈ 9% CPU).
+
+## 10. Воспроизведение
+
+Скрипты — в `benchmarks/late_materialization/` (см. `README.md` там же):
+
+- `run.py` — прогоняет запросы через `EXPLAIN ANALYZE` на нескольких сборках
+  `datafusion-cli` и DuckDB, чередуя варианты внутри раунда, сохраняет логи
+  каждого запуска и `results.json`, печатает медиану и разброс;
+- `memguard.sh` — ограничивает память и время одного запуска (на macOS
+  `ulimit -v` не работает).
+
+Таблица из раздела 7:
+
+```shell
+python3 benchmarks/late_materialization/run.py \
+  --hits benchmarks/data/hits.parquet \
+  --datafusion main=target/release/datafusion-cli \
+  --late-materialization off,on \
+  --duckdb "$(which duckdb)"
+```
+
+Таблица из раздела 3.1 —
+`--queries c1_google,c4_google,all_google,c1_ru,c4_ru,all_ru` и по одному
+`--datafusion` на каждую сборку. Профиль из раздела 3.3 снимался `sample` на
+сборке `--profile profiling` (команда — в README).
+
+Сторож памяти понадобился после того, как первая версия правила зациклилась:
+`transform_down` спускался в новое поддерево, снова находил TopK над Parquet и
+переписывал его бесконечно (исправлено).

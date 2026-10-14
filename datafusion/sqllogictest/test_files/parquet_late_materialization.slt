@@ -1,0 +1,119 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Tests for datafusion.optimizer.enable_parquet_late_materialization
+
+statement ok
+COPY (
+  SELECT v AS id, (v * 7919) % 100003 AS k, 'url_' || (v % 97) AS url,
+         'title_' || v AS title, v * 2 AS a
+  FROM generate_series(0, 29999) t(v)
+)
+TO 'test_files/scratch/parquet_late_materialization/t.parquet'
+STORED AS PARQUET OPTIONS ('format.max_row_group_size' '5000');
+
+statement ok
+CREATE EXTERNAL TABLE t STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_late_materialization/t.parquet';
+
+statement ok
+SET datafusion.optimizer.enable_parquet_late_materialization = true;
+
+query TT
+EXPLAIN SELECT * FROM t WHERE url LIKE '%_1%' ORDER BY k LIMIT 3;
+----
+logical_plan
+01)Sort: t.k ASC NULLS LAST, fetch=3
+02)--Filter: t.url LIKE Utf8View("%_1%")
+03)----TableScan: t projection=[id, k, url, title, a], partial_filters=[t.url LIKE Utf8View("%_1%")]
+physical_plan
+01)ParquetFetchByRowIdExec: fetch=3, columns=5
+02)--SortPreservingMergeExec: [k@0 ASC NULLS LAST], fetch=3
+03)----SortExec: TopK(fetch=3), expr=[k@0 ASC NULLS LAST], preserve_partitioning=[true]
+04)------FilterExec: url@1 LIKE %_1%
+05)--------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+06)----------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_late_materialization/t.parquet]]}, projection=[k, url, CAST(__datafusion_file_row_index@5 AS Int64) as __late_materialization_row_index], file_type=parquet, predicate=url@2 LIKE %_1% AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+# Results must match the plan without late materialization (checked again at
+# the end of this file with the rewrite disabled).
+query IITTI
+SELECT * FROM t WHERE url LIKE '%_1%' ORDER BY k, id LIMIT 7;
+----
+20483 11 url_16 title_20483 40966
+15116 13 url_81 title_15116 30232
+4382 17 url_17 title_4382 8764
+19498 30 url_1 title_19498 38996
+23880 47 url_18 title_23880 47760
+13146 51 url_51 title_13146 26292
+7779 53 url_19 title_7779 15558
+
+query IITTI
+SELECT * FROM t ORDER BY k DESC, id LIMIT 3;
+----
+5367 100001 url_32 title_5367 10734
+10734 99999 url_64 title_10734 21468
+16101 99997 url_96 title_16101 32202
+
+# Only the selected columns are fetched.
+query TI
+SELECT title, k FROM t ORDER BY k LIMIT 2;
+----
+title_0 0
+title_25850 9
+
+# No row passes the filter
+query IITTI
+SELECT * FROM t WHERE url = 'nope' ORDER BY k LIMIT 5;
+----
+
+# Larger limits than late_materialization_max_rows are not rewritten
+statement ok
+SET datafusion.optimizer.late_materialization_max_rows = 2;
+
+query TT
+EXPLAIN SELECT * FROM t ORDER BY k LIMIT 3;
+----
+logical_plan
+01)Sort: t.k ASC NULLS LAST, fetch=3
+02)--TableScan: t projection=[id, k, url, title, a]
+physical_plan
+01)SortExec: TopK(fetch=3), expr=[k@1 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_late_materialization/t.parquet]]}, projection=[id, k, url, title, a], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[k@1 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+statement ok
+RESET datafusion.optimizer.late_materialization_max_rows;
+
+# Same results with the rewrite disabled
+statement ok
+SET datafusion.optimizer.enable_parquet_late_materialization = false;
+
+query IITTI
+SELECT * FROM t WHERE url LIKE '%_1%' ORDER BY k, id LIMIT 7;
+----
+20483 11 url_16 title_20483 40966
+15116 13 url_81 title_15116 30232
+4382 17 url_17 title_4382 8764
+19498 30 url_1 title_19498 38996
+23880 47 url_18 title_23880 47760
+13146 51 url_51 title_13146 26292
+7779 53 url_19 title_7779 15558
+
+statement ok
+RESET datafusion.optimizer.enable_parquet_late_materialization;
+
+statement ok
+DROP TABLE t;
