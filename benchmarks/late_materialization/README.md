@@ -61,6 +61,24 @@ python3 benchmarks/late_materialization/run.py \
   --out /tmp/filters
 ```
 
+Calibrate `late_materialization_min_saved_bytes_ratio`: disable the threshold
+with `--set` (any DataFusion setting, repeatable) and compare queries whose late
+columns are a growing share of the bytes:
+
+```shell
+python3 benchmarks/late_materialization/run.py \
+  --hits benchmarks/data/hits.parquet \
+  --datafusion main=target/release/datafusion-cli \
+  --late-materialization off,on \
+  --set datafusion.optimizer.late_materialization_min_saved_bytes_ratio=0 \
+  --queries topk_google_ints,topk_google_title,topk_google_title_referer,topk_google \
+  --out /tmp/calibration
+```
+
+The `ParquetFetchByRowIdExec` line of each `_lm` log shows the fetch I/O
+estimate: `estimated_page_requests` / `estimated_page_bytes` and
+`estimated_chunk_requests` / `estimated_chunk_bytes`.
+
 Print the summary of an earlier run:
 
 ```shell

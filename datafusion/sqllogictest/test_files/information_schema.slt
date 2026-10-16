@@ -337,6 +337,7 @@ datafusion.optimizer.hash_join_single_partition_threshold 4194304
 datafusion.optimizer.hash_join_single_partition_threshold_rows 131072
 datafusion.optimizer.join_reordering true
 datafusion.optimizer.late_materialization_max_rows 100
+datafusion.optimizer.late_materialization_min_saved_bytes_ratio 0.7
 datafusion.optimizer.max_passes 3
 datafusion.optimizer.prefer_existing_sort false
 datafusion.optimizer.prefer_existing_union false
@@ -508,6 +509,7 @@ datafusion.optimizer.hash_join_single_partition_threshold 4194304 The maximum es
 datafusion.optimizer.hash_join_single_partition_threshold_rows 131072 The maximum estimated size in rows for one input side of a HashJoin will be collected into a single partition
 datafusion.optimizer.join_reordering true When set to true, the physical plan optimizer may swap join inputs based on statistics. When set to false, statistics-driven join input reordering is disabled and the original join order in the query is used.
 datafusion.optimizer.late_materialization_max_rows 100 The largest `LIMIT` for which `enable_parquet_late_materialization` rewrites a TopK.
+datafusion.optimizer.late_materialization_min_saved_bytes_ratio 0.7 The smallest share of the scanned bytes that the columns read late must have for `enable_parquet_late_materialization` to rewrite a TopK, between 0 and 1. The byte sizes come from the scan statistics; without them every column counts as the same size.
 datafusion.optimizer.max_passes 3 The logical optimizer applies rules in order for up to `max_passes` passes, stopping early if a pass leaves the plan unchanged or repeats an earlier plan. The physical optimizer always runs in one pass.
 datafusion.optimizer.prefer_existing_sort false When true, DataFusion will opportunistically remove sorts when the data is already sorted, (i.e. setting `preserve_order` to true on `RepartitionExec`  and using `SortPreservingMergeExec`) When false, DataFusion will maximize plan parallelism using `RepartitionExec` even if this requires subsequently resorting data using a `SortExec`.
 datafusion.optimizer.prefer_existing_union false When set to true, the optimizer will not attempt to convert Union to Interleave

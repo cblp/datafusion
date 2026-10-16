@@ -1692,6 +1692,12 @@ config_namespace! {
         /// rewrites a TopK.
         pub late_materialization_max_rows: usize, default = 100
 
+        /// The smallest share of the scanned bytes that the columns read late
+        /// must have for `enable_parquet_late_materialization` to rewrite a
+        /// TopK, between 0 and 1. The byte sizes come from the scan statistics;
+        /// without them every column counts as the same size.
+        pub late_materialization_min_saved_bytes_ratio: f64, default = 0.7
+
         /// When set to true, uncorrelated scalar subqueries are
         /// left in the logical plan and executed by `ScalarSubqueryExec` during
         /// physical execution. When set to false, all scalar subqueries

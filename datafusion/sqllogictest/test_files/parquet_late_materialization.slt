@@ -97,6 +97,85 @@ physical_plan
 statement ok
 RESET datafusion.optimizer.late_materialization_max_rows;
 
+# The column read late (id, 8 bytes per row) is a smaller share of the scanned
+# bytes than late_materialization_min_saved_bytes_ratio (0.7 by default) next
+# to the sort column (title): not rewritten
+query TT
+EXPLAIN SELECT id, title FROM t ORDER BY title LIMIT 3;
+----
+logical_plan
+01)Sort: t.title ASC NULLS LAST, fetch=3
+02)--TableScan: t projection=[id, title]
+physical_plan
+01)SortExec: TopK(fetch=3), expr=[title@1 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_late_materialization/t.parquet]]}, projection=[id, title], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[title@1 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+statement ok
+SET datafusion.optimizer.late_materialization_min_saved_bytes_ratio = 0;
+
+query TT
+EXPLAIN SELECT id, title FROM t ORDER BY title LIMIT 3;
+----
+logical_plan
+01)Sort: t.title ASC NULLS LAST, fetch=3
+02)--TableScan: t projection=[id, title]
+physical_plan
+01)ParquetFetchByRowIdExec: fetch=3, columns=2
+02)--SortExec: TopK(fetch=3), expr=[title@0 ASC NULLS LAST], preserve_partitioning=[false]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_late_materialization/t.parquet]]}, projection=[title, CAST(__datafusion_file_row_index@5 AS Int64) as __late_materialization_row_index], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[title@1 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+query IT
+SELECT id, title FROM t ORDER BY title LIMIT 3;
+----
+0 title_0
+1 title_1
+10 title_10
+
+statement ok
+RESET datafusion.optimizer.late_materialization_min_saved_bytes_ratio;
+
+# With filter pushdown the filter on title runs inside the scan: the narrow
+# scan still reads title, so only id is saved and the TopK is not rewritten
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = true;
+
+query TT
+EXPLAIN SELECT k, title, id FROM t WHERE title LIKE '%1%' ORDER BY k LIMIT 3;
+----
+logical_plan
+01)Sort: t.k ASC NULLS LAST, fetch=3
+02)--Projection: t.k, t.title, t.id
+03)----Filter: t.title LIKE Utf8View("%1%")
+04)------TableScan: t projection=[id, k, title], partial_filters=[t.title LIKE Utf8View("%1%")]
+physical_plan
+01)ProjectionExec: expr=[k@1 as k, title@2 as title, id@0 as id]
+02)--SortExec: TopK(fetch=3), expr=[k@1 ASC NULLS LAST], preserve_partitioning=[false]
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_late_materialization/t.parquet]]}, projection=[id, k, title], file_type=parquet, predicate=title@3 LIKE %1% AND DynamicFilter [ empty ], sort_order_for_reorder=[k@1 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+# Rewritten when any saving is enough
+statement ok
+SET datafusion.optimizer.late_materialization_min_saved_bytes_ratio = 0;
+
+query TT
+EXPLAIN SELECT k, title, id FROM t WHERE title LIKE '%1%' ORDER BY k LIMIT 3;
+----
+logical_plan
+01)Sort: t.k ASC NULLS LAST, fetch=3
+02)--Projection: t.k, t.title, t.id
+03)----Filter: t.title LIKE Utf8View("%1%")
+04)------TableScan: t projection=[id, k, title], partial_filters=[t.title LIKE Utf8View("%1%")]
+physical_plan
+01)ProjectionExec: expr=[k@1 as k, title@2 as title, id@0 as id]
+02)--ParquetFetchByRowIdExec: fetch=3, columns=3
+03)----SortExec: TopK(fetch=3), expr=[k@0 ASC NULLS LAST], preserve_partitioning=[false]
+04)------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_late_materialization/t.parquet]]}, projection=[k, CAST(__datafusion_file_row_index@5 AS Int64) as __late_materialization_row_index], file_type=parquet, predicate=title@3 LIKE %1% AND DynamicFilter [ empty ], sort_order_for_reorder=[k@1 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+statement ok
+RESET datafusion.optimizer.late_materialization_min_saved_bytes_ratio;
+
+statement ok
+RESET datafusion.execution.parquet.pushdown_filters;
+
 # Same results with the rewrite disabled
 statement ok
 SET datafusion.optimizer.enable_parquet_late_materialization = false;

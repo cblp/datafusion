@@ -59,6 +59,15 @@ QUERIES = {
     # The sort key is not correlated with the file order, so the TopK dynamic
     # filter cannot prune row groups
     "topk_watchid_google": f'SELECT * FROM hits WHERE {GOOGLE} ORDER BY "WatchID" LIMIT 10',
+    # TopK with fewer output columns, to calibrate
+    # late_materialization_min_saved_bytes_ratio: the late columns are small
+    # integers, one wide string, two wide strings
+    "topk_google_ints": 'SELECT "EventTime", "URL", "CounterID", "RegionID", "UserID" '
+    f'FROM hits WHERE {GOOGLE} ORDER BY "EventTime" LIMIT 10',
+    "topk_google_title": 'SELECT "EventTime", "URL", "Title" '
+    f'FROM hits WHERE {GOOGLE} ORDER BY "EventTime" LIMIT 10',
+    "topk_google_title_referer": 'SELECT "EventTime", "URL", "Title", "Referer" '
+    f'FROM hits WHERE {GOOGLE} ORDER BY "EventTime" LIMIT 10',
 }
 DEFAULT_QUERIES = ["topk_google", "topk_ru", "topk_nofilter", "topk_watchid_google"]
 
@@ -85,6 +94,13 @@ def parse_named(value: str) -> tuple[str, str]:
     return name, path
 
 
+def parse_setting(value: str) -> tuple[str, str]:
+    key, sep, setting = value.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(f"expected KEY=VALUE, got {value!r}")
+    return key, setting
+
+
 def build_variants(args: argparse.Namespace) -> list[Variant]:
     variants = []
     for (name, binary), pushdown, late in itertools.product(
@@ -99,7 +115,9 @@ def build_variants(args: argparse.Namespace) -> list[Variant]:
     return variants
 
 
-def datafusion_sql(variant: Variant, hits: str, query: str, partitions: int) -> str:
+def datafusion_sql(
+    variant: Variant, hits: str, query: str, partitions: int, settings: list[str]
+) -> str:
     pushdown = "true" if variant.pushdown else "false"
     lines = [
         "SET datafusion.execution.parquet.binary_as_string = true;",
@@ -113,6 +131,7 @@ def datafusion_sql(variant: Variant, hits: str, query: str, partitions: int) -> 
         lines.append(
             "SET datafusion.optimizer.enable_parquet_late_materialization = true;"
         )
+    lines += [f"SET {key} = {value};" for key, value in map(parse_setting, settings)]
     lines += [
         f"CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{hits}';",
         f"EXPLAIN ANALYZE {query};",
@@ -138,7 +157,7 @@ def run_once(
         command = [variant.binary]
         time_re = r"Run Time \(s\): real ([\d.]+)"
     else:
-        sql = datafusion_sql(variant, args.hits, query, args.partitions)
+        sql = datafusion_sql(variant, args.hits, query, args.partitions, args.set)
         command = [variant.binary, "--format", "csv"]
         time_re = r"Elapsed ([\d.]+) seconds"
     guard = [str(MEMGUARD), str(args.mem_limit_mb), str(args.timeout)]
@@ -209,6 +228,13 @@ def main() -> int:
         default=",".join(DEFAULT_QUERIES),
         help=f"comma-separated query names, or 'all'; known: {', '.join(QUERIES)}",
     )
+    parser.add_argument(
+        "--set",
+        metavar="KEY=VALUE",
+        action="append",
+        default=[],
+        help="extra DataFusion setting for every DataFusion run; repeatable",
+    )
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument(
         "--partitions",
@@ -236,6 +262,11 @@ def main() -> int:
         parser.error("--hits is required")
     if not args.datafusion and not args.duckdb:
         parser.error("give at least one --datafusion or --duckdb")
+    for setting in args.set:
+        try:
+            parse_setting(setting)
+        except argparse.ArgumentTypeError as error:
+            parser.error(str(error))
 
     def on_off(name: str, value: str) -> list[bool]:
         flags = {"off": False, "on": True}
