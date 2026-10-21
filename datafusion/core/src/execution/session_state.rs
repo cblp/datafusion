@@ -1725,7 +1725,7 @@ impl SessionStateBuilder {
             relation_planners: relation_planners.unwrap_or_default(),
             #[cfg(feature = "sql")]
             type_planner,
-            optimizer: optimizer.unwrap_or_default(),
+            optimizer: optimizer.unwrap_or_else(default_optimizer),
             physical_optimizers: physical_optimizers
                 .unwrap_or_else(default_physical_optimizer),
             query_planner: query_planner
@@ -2546,6 +2546,17 @@ pub trait CacheFactory: Debug + Send + Sync {
     ) -> datafusion_common::Result<LogicalPlan>;
 }
 
+/// The default logical optimizer, plus rules that depend on optional crates.
+fn default_optimizer() -> Optimizer {
+    #[cfg_attr(not(feature = "parquet"), expect(unused_mut))]
+    let mut optimizer = Optimizer::new();
+    #[cfg(feature = "parquet")]
+    optimizer.rules.push(Arc::new(
+        crate::execution::late_materialization_join::LateMaterializationJoin::new(),
+    ));
+    optimizer
+}
+
 /// The default physical optimizer, plus rules that depend on optional crates.
 fn default_physical_optimizer() -> PhysicalOptimizer {
     #[cfg_attr(not(feature = "parquet"), expect(unused_mut))]
@@ -2588,7 +2599,6 @@ mod tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
     use datafusion_expr::HigherOrderUDF;
-    use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
     use datafusion_session::Session;
@@ -2764,7 +2774,7 @@ mod tests {
 
         assert_eq!(
             state.optimizers().len(),
-            Optimizer::default().rules.len() + 1
+            super::default_optimizer().rules.len() + 1
         );
     }
 

@@ -253,6 +253,9 @@ pub(super) struct ParquetMorselizer {
     pub preserve_order: bool,
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Optional predicate on the file row index alone, applied as a row
+    /// selection (see `ParquetSource::row_index_predicate`)
+    pub(crate) row_index_predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Table schema, including partition columns.
     pub table_schema: TableSchema,
     /// Optional hint for how large the initial request to read parquet metadata
@@ -461,6 +464,9 @@ struct PreparedParquetOpen {
     output_schema: SchemaRef,
     projection: ProjectionExprs,
     predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Predicate on the file row index alone and the row index field it
+    /// references, applied as a row selection when row groups are pruned
+    row_index_predicate: Option<(Arc<dyn PhysicalExpr>, FieldRef)>,
     /// Per-scan virtual-column state, Arc-cloned from [`ParquetMorselizer`] so
     /// each file shares validated fields, precomputed null replacements, and
     /// the logical-with-virtual schema. `None` when no virtual columns were
@@ -987,6 +993,20 @@ impl ParquetMorselizer {
             output_schema,
             projection,
             predicate,
+            row_index_predicate: self.row_index_predicate.as_ref().and_then(
+                |predicate| {
+                    self.table_schema
+                        .virtual_columns()
+                        .iter()
+                        .find(|field| {
+                            matches!(
+                                ParquetVirtualColumn::try_from(*field),
+                                Ok(ParquetVirtualColumn::RowNumber(_))
+                            )
+                        })
+                        .map(|field| (Arc::clone(predicate), Arc::clone(field)))
+                },
+            ),
             virtual_state: self.virtual_state.as_ref().map(Arc::clone),
             reorder_predicates: self.reorder_filters,
             pushdown_filters: self.pushdown_filters,
@@ -1285,6 +1305,23 @@ impl FiltersPreparedParquetOpen {
                 range,
                 prepared.row_group_range_assignment,
             );
+        }
+
+        // Select exactly the rows whose row number satisfies the row index
+        // predicate, without reading any data
+        if let Some((predicate, row_index_field)) = prepared.row_index_predicate.as_ref()
+        {
+            // Registered only for scans with such a predicate, so that other
+            // scans do not show it.
+            let rows_pruned = MetricBuilder::new(&prepared.metrics)
+                .with_new_label("filename", prepared.file_name.clone())
+                .pruning_metrics("row_index_rows_pruned", prepared.partition_index);
+            row_groups.prune_by_row_index(
+                rg_metadata,
+                predicate,
+                row_index_field,
+                &rows_pruned,
+            )?;
         }
 
         // Substituting the columns file statistics proved constant
@@ -2616,6 +2653,7 @@ mod test {
                 limit: self.limit,
                 preserve_order: self.preserve_order,
                 predicate: self.predicate,
+                row_index_predicate: None,
                 table_schema,
                 metadata_size_hint: self.metadata_size_hint,
                 metrics: self.metrics,

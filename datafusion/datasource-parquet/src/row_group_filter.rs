@@ -22,14 +22,21 @@ use super::{ParquetAccessPlan, ParquetFileMetrics, RowGroupAccess};
 use crate::bloom_filter::BloomFilterStatistics;
 use crate::metadata::{has_untrusted_byte_array_stats, has_untrusted_min_max_order};
 use crate::pruning::build_inverted_predicate;
-use arrow::array::{ArrayRef, BooleanArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, UInt64Array};
 use arrow::compute::nullif;
+use arrow::compute::prep_null_mask_filter;
+use arrow::datatypes::FieldRef;
 use arrow::datatypes::Schema;
+use datafusion_common::cast::as_boolean_array;
 use datafusion_common::parquet_config::RowGroupRangeAssignment;
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::{Column, Result, ScalarValue};
 use datafusion_datasource::FileRange;
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_physical_plan::metrics::PruningMetrics;
 use datafusion_pruning::PruningPredicate;
+use parquet::arrow::arrow_reader::RowSelection;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::basic::ColumnOrder;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
@@ -117,6 +124,59 @@ impl RowGroupAccessPlanFilter {
     /// Returns a reference to the inner access plan.
     pub(crate) fn access_plan(&self) -> &ParquetAccessPlan {
         &self.access_plan
+    }
+
+    /// Narrow the remaining row groups to the rows whose file row index (row
+    /// number within the whole file) satisfies `predicate`, which references
+    /// only the `row_index_field` virtual column.
+    ///
+    /// The predicate is evaluated on the row numbers of each row group, without
+    /// reading any data: row groups with no matching row are skipped, the
+    /// others get a [`RowSelection`] of exactly the matching rows. This applies
+    /// the predicate exactly, so it needs no `RowFilter`.
+    pub(crate) fn prune_by_row_index(
+        &mut self,
+        rg_metadata: &[RowGroupMetaData],
+        predicate: &Arc<dyn PhysicalExpr>,
+        row_index_field: &FieldRef,
+        rows_pruned: &PruningMetrics,
+    ) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Arc::clone(row_index_field)]));
+        let predicate = reassign_expr_columns(Arc::clone(predicate), &schema)?;
+        let mut starts = Vec::with_capacity(rg_metadata.len());
+        let mut start = 0i64;
+        for row_group in rg_metadata {
+            starts.push(start);
+            start += row_group.num_rows();
+        }
+        let remaining: Vec<usize> = self.row_group_indexes().collect();
+        for idx in remaining {
+            let num_rows = rg_metadata[idx].num_rows();
+            let row_numbers =
+                Int64Array::from_iter_values(starts[idx]..starts[idx] + num_rows);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(row_numbers) as ArrayRef],
+            )?;
+            let result = predicate.evaluate(&batch)?.into_array(num_rows as usize)?;
+            let mask = as_boolean_array(&result)?;
+            let mask = if mask.null_count() > 0 {
+                prep_null_mask_filter(mask)
+            } else {
+                mask.clone()
+            };
+            let selected = mask.true_count();
+            let num_rows = num_rows as usize;
+            rows_pruned.add_matched(selected);
+            rows_pruned.add_pruned(num_rows - selected);
+            if selected == 0 {
+                self.access_plan.skip(idx);
+            } else if selected < num_rows {
+                self.access_plan
+                    .scan_selection(idx, RowSelection::from_filters(&[mask]));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the is_fully_matched vector.

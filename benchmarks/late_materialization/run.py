@@ -84,7 +84,9 @@ class Variant:
     binary: str
     duckdb: bool = False
     pushdown: bool = False
-    late_materialization: bool = False
+    # "off", "on" (enable_parquet_late_materialization, the physical rule) or
+    # "join" (enable_late_materialization_join, the logical semi join rule)
+    late_materialization: str = "off"
 
 
 def parse_named(value: str) -> tuple[str, str]:
@@ -101,14 +103,20 @@ def parse_setting(value: str) -> tuple[str, str]:
     return key, setting
 
 
+LATE_MATERIALIZATION_SUFFIX = {"off": "", "on": "_lm", "join": "_lj"}
+LATE_MATERIALIZATION_SETTING = {
+    "on": "datafusion.optimizer.enable_parquet_late_materialization",
+    "join": "datafusion.optimizer.enable_late_materialization_join",
+}
+
+
 def build_variants(args: argparse.Namespace) -> list[Variant]:
     variants = []
     for (name, binary), pushdown, late in itertools.product(
         args.datafusion, args.pushdown, args.late_materialization
     ):
         suffix = f"pd_{'on' if pushdown else 'off'}"
-        if late:
-            suffix += "_lm"
+        suffix += LATE_MATERIALIZATION_SUFFIX[late]
         variants.append(Variant(f"{name}_{suffix}", binary, False, pushdown, late))
     if args.duckdb:
         variants.append(Variant("duckdb", args.duckdb, duckdb=True))
@@ -127,10 +135,9 @@ def datafusion_sql(
         "SET datafusion.explain.format = 'indent';",
     ]
     # Only set when enabled, so that builds without the option still run.
-    if variant.late_materialization:
-        lines.append(
-            "SET datafusion.optimizer.enable_parquet_late_materialization = true;"
-        )
+    if variant.late_materialization != "off":
+        setting = LATE_MATERIALIZATION_SETTING[variant.late_materialization]
+        lines.append(f"SET {setting} = true;")
     lines += [f"SET {key} = {value};" for key, value in map(parse_setting, settings)]
     lines += [
         f"CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{hits}';",
@@ -221,7 +228,9 @@ def main() -> int:
     parser.add_argument(
         "--late-materialization",
         default="off",
-        help="enable_parquet_late_materialization values: off, on or off,on",
+        help="comma-separated late materialization modes: off; on (the "
+        "physical rule, enable_parquet_late_materialization); join (the "
+        "logical semi join rule, enable_late_materialization_join)",
     )
     parser.add_argument(
         "--queries",
@@ -276,9 +285,14 @@ def main() -> int:
             parser.error(f"{name} must be off, on or off,on")
 
     args.pushdown = on_off("--pushdown", args.pushdown)
-    args.late_materialization = on_off(
-        "--late-materialization", args.late_materialization
-    )
+    args.late_materialization = args.late_materialization.split(",")
+    unknown_modes = [
+        mode
+        for mode in args.late_materialization
+        if mode not in LATE_MATERIALIZATION_SUFFIX
+    ]
+    if unknown_modes:
+        parser.error("--late-materialization modes must be off, on or join")
     names = list(QUERIES) if args.queries == "all" else args.queries.split(",")
     unknown = [name for name in names if name not in QUERIES]
     if unknown:

@@ -1,0 +1,220 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Tests for datafusion.optimizer.enable_late_materialization_join and for
+# predicates on file_row_index() applied as a Parquet row selection
+
+statement ok
+COPY (
+  SELECT v AS id, (v * 7919) % 100003 AS k, 'url_' || (v % 97) AS url,
+         'title_' || v AS title, v * 2 AS a
+  FROM generate_series(0, 29999) t(v)
+)
+TO 'test_files/scratch/late_materialization_join/t.parquet'
+STORED AS PARQUET OPTIONS ('format.max_row_group_size' '5000');
+
+statement ok
+CREATE EXTERNAL TABLE t STORED AS PARQUET
+LOCATION 'test_files/scratch/late_materialization_join/t.parquet';
+
+statement ok
+SET datafusion.optimizer.enable_late_materialization_join = true;
+
+query TT
+EXPLAIN SELECT * FROM t WHERE url LIKE '%_1%' ORDER BY k LIMIT 3;
+----
+logical_plan
+01)Projection: __late_materialization_full.id AS id, __late_materialization_full.k AS k, __late_materialization_full.url AS url, __late_materialization_full.title AS title, __late_materialization_full.a AS a
+02)--Sort: __late_materialization_full.k ASC NULLS LAST, fetch=3
+03)----Projection: __late_materialization_full.id, __late_materialization_full.k, __late_materialization_full.url, __late_materialization_full.title, __late_materialization_full.a
+04)------LeftSemi Join: __late_materialization_full.__late_materialization_rid = __late_materialization_top.__late_materialization_rid
+05)--------SubqueryAlias: __late_materialization_full
+06)----------Projection: t.id, t.k, t.url, t.title, t.a, file_row_index() AS __late_materialization_rid
+07)------------TableScan: t projection=[id, k, url, title, a]
+08)--------SubqueryAlias: __late_materialization_top
+09)----------Projection: __late_materialization_rid
+10)------------Sort: t.k ASC NULLS LAST, fetch=3
+11)--------------Projection: t.k, __datafusion_extracted_2 AS __late_materialization_rid
+12)----------------Filter: t.url LIKE Utf8View("%_1%")
+13)------------------Projection: file_row_index() AS __datafusion_extracted_2, t.k, t.url
+14)--------------------TableScan: t projection=[k, url], partial_filters=[t.url LIKE Utf8View("%_1%")]
+physical_plan
+01)SortPreservingMergeExec: [k@1 ASC NULLS LAST], fetch=3
+02)--SortExec: TopK(fetch=3), expr=[k@1 ASC NULLS LAST], preserve_partitioning=[true]
+03)----HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(__late_materialization_rid@0, __late_materialization_rid@5)], projection=[id@0, k@1, url@2, title@3, a@4]
+04)------ProjectionExec: expr=[__late_materialization_rid@1 as __late_materialization_rid]
+05)--------SortPreservingMergeExec: [k@0 ASC NULLS LAST], fetch=3
+06)----------SortExec: TopK(fetch=3), expr=[k@0 ASC NULLS LAST], preserve_partitioning=[true]
+07)------------ProjectionExec: expr=[k@0 as k, __datafusion_extracted_2@1 as __late_materialization_rid]
+08)--------------FilterExec: url@2 LIKE %_1%, projection=[k@1, __datafusion_extracted_2@0]
+09)----------------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+10)------------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/late_materialization_join/t.parquet]]}, projection=[CAST(__datafusion_file_row_index@5 AS Int64) as __datafusion_extracted_2, k, url], file_type=parquet, predicate=url@2 LIKE %_1% AND DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+11)------RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1, maintains_sort_order=true
+12)--------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/late_materialization_join/t.parquet]]}, projection=[id, k, url, title, a, CAST(__datafusion_file_row_index@5 AS Int64) as __late_materialization_rid], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, predicate=DynamicFilter [ empty ], row_index_predicate=DynamicFilter [ empty ], dynamic_rg_pruning=eligible
+
+# Results must match the plan without the rewrite (checked again at the end of
+# this file with the rewrite disabled)
+query IITTI
+SELECT * FROM t WHERE url LIKE '%_1%' ORDER BY k, id LIMIT 7;
+----
+20483 11 url_16 title_20483 40966
+15116 13 url_81 title_15116 30232
+4382 17 url_17 title_4382 8764
+19498 30 url_1 title_19498 38996
+23880 47 url_18 title_23880 47760
+13146 51 url_51 title_13146 26292
+7779 53 url_19 title_7779 15558
+
+query IITTI
+SELECT * FROM t ORDER BY k DESC, id LIMIT 3;
+----
+5367 100001 url_32 title_5367 10734
+10734 99999 url_64 title_10734 21468
+16101 99997 url_96 title_16101 32202
+
+# Expressions in the output and in the sort key
+query IT
+SELECT a + 1 AS a1, title FROM t WHERE id % 2 = 0 ORDER BY a - id DESC LIMIT 3;
+----
+59997 title_29998
+59993 title_29996
+59989 title_29994
+
+# No row passes the filter
+query IITTI
+SELECT * FROM t WHERE url = 'nope' ORDER BY k LIMIT 5;
+----
+
+# Nothing left to read late: not rewritten
+query TT
+EXPLAIN SELECT k FROM t ORDER BY k LIMIT 3;
+----
+logical_plan
+01)Sort: t.k ASC NULLS LAST, fetch=3
+02)--TableScan: t projection=[k]
+physical_plan
+01)SortExec: TopK(fetch=3), expr=[k@0 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/late_materialization_join/t.parquet]]}, projection=[k], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[k@0 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+# Larger limits than late_materialization_max_rows are not rewritten
+statement ok
+SET datafusion.optimizer.late_materialization_max_rows = 2;
+
+query TT
+EXPLAIN SELECT * FROM t ORDER BY k LIMIT 3;
+----
+logical_plan
+01)Sort: t.k ASC NULLS LAST, fetch=3
+02)--TableScan: t projection=[id, k, url, title, a]
+physical_plan
+01)SortExec: TopK(fetch=3), expr=[k@1 ASC NULLS LAST], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/late_materialization_join/t.parquet]]}, projection=[id, k, url, title, a], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[k@1 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+statement ok
+RESET datafusion.optimizer.late_materialization_max_rows;
+
+# A table of several files is not rewritten: the row index is unique only
+# within one file
+statement ok
+COPY (SELECT v AS id, v % 7 AS k, 'title_' || v AS title FROM generate_series(0, 99) t(v))
+TO 'test_files/scratch/late_materialization_join/dir/1.parquet' STORED AS PARQUET;
+
+statement ok
+COPY (SELECT v AS id, v % 7 AS k, 'title_' || v AS title FROM generate_series(100, 199) t(v))
+TO 'test_files/scratch/late_materialization_join/dir/2.parquet' STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE d STORED AS PARQUET
+LOCATION 'test_files/scratch/late_materialization_join/dir/';
+
+query TT
+EXPLAIN SELECT * FROM d ORDER BY k, id LIMIT 3;
+----
+logical_plan
+01)Sort: d.k ASC NULLS LAST, d.id ASC NULLS LAST, fetch=3
+02)--TableScan: d projection=[id, k, title]
+physical_plan
+01)SortPreservingMergeExec: [k@1 ASC NULLS LAST, id@0 ASC NULLS LAST], fetch=3
+02)--SortExec: TopK(fetch=3), expr=[k@1 ASC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[true]
+03)----DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/late_materialization_join/dir/1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/late_materialization_join/dir/2.parquet]]}, projection=[id, k, title], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[k@1 ASC NULLS LAST, id@0 ASC NULLS LAST], dynamic_rg_pruning=eligible
+
+query IIT
+SELECT * FROM d ORDER BY k, id LIMIT 3;
+----
+0 0 title_0
+7 0 title_7
+14 0 title_14
+
+# Predicates on file_row_index() alone select exactly the matching rows
+query II
+SELECT id, file_row_index() AS r FROM t WHERE file_row_index() IN (3, 5001, 29999)
+ORDER BY r;
+----
+3 3
+5001 5001
+29999 29999
+
+query I
+SELECT count(*) FROM t WHERE file_row_index() BETWEEN 1000 AND 1999;
+----
+1000
+
+query I
+SELECT id FROM t WHERE file_row_index() < 3 OR id = 7 ORDER BY id;
+----
+0
+1
+2
+7
+
+# Same results with the rewrite disabled
+statement ok
+SET datafusion.optimizer.enable_late_materialization_join = false;
+
+query IITTI
+SELECT * FROM t WHERE url LIKE '%_1%' ORDER BY k, id LIMIT 7;
+----
+20483 11 url_16 title_20483 40966
+15116 13 url_81 title_15116 30232
+4382 17 url_17 title_4382 8764
+19498 30 url_1 title_19498 38996
+23880 47 url_18 title_23880 47760
+13146 51 url_51 title_13146 26292
+7779 53 url_19 title_7779 15558
+
+query IITTI
+SELECT * FROM t ORDER BY k DESC, id LIMIT 3;
+----
+5367 100001 url_32 title_5367 10734
+10734 99999 url_64 title_10734 21468
+16101 99997 url_96 title_16101 32202
+
+query IT
+SELECT a + 1 AS a1, title FROM t WHERE id % 2 = 0 ORDER BY a - id DESC LIMIT 3;
+----
+59997 title_29998
+59993 title_29996
+59989 title_29994
+
+statement ok
+RESET datafusion.optimizer.enable_late_materialization_join;
+
+statement ok
+DROP TABLE t;
+
+statement ok
+DROP TABLE d;

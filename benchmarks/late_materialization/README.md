@@ -31,8 +31,10 @@ ClickBench queries that read many columns through a filter or a TopK.
 - Optionally a `duckdb` binary.
 - Python 3.11+ (standard library only).
 
-Builds without the `enable_parquet_late_materialization` option report the
-`_lm` variants as `ERR`.
+`--late-materialization` takes a comma-separated list of modes: `off`; `on`,
+the physical rule (`enable_parquet_late_materialization`, variants `_lm`); and
+`join`, the logical semi join rule (`enable_late_materialization_join`,
+variants `_lj`). Builds without an option report its variants as `ERR`.
 
 ## Usage
 
@@ -44,7 +46,7 @@ cargo build --release -p datafusion-cli
 python3 benchmarks/late_materialization/run.py \
   --hits benchmarks/data/hits.parquet \
   --datafusion main=target/release/datafusion-cli \
-  --late-materialization off,on \
+  --late-materialization off,on,join \
   --duckdb "$(which duckdb)" \
   --out /tmp/late_materialization
 ```

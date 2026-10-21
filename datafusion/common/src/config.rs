@@ -1688,8 +1688,16 @@ config_namespace! {
         /// winning rows only (late materialization).
         pub enable_parquet_late_materialization: bool, default = false
 
-        /// The largest `LIMIT` for which `enable_parquet_late_materialization`
-        /// rewrites a TopK.
+        /// When set to true, a TopK (`ORDER BY ... LIMIT n`) over a single
+        /// Parquet file is rewritten in the logical plan into a semi join on
+        /// `file_row_index()`: a narrow TopK finds the row numbers of the `n`
+        /// winning rows, and a scan of all columns reads only those rows,
+        /// selected by the join's dynamic filter.
+        pub enable_late_materialization_join: bool, default = false
+
+        /// The largest `LIMIT` for which late materialization
+        /// (`enable_parquet_late_materialization` or
+        /// `enable_late_materialization_join`) rewrites a TopK.
         pub late_materialization_max_rows: usize, default = 100
 
         /// The smallest share of the scanned bytes that the columns read late

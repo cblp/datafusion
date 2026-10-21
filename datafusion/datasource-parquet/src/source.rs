@@ -305,6 +305,12 @@ pub struct ParquetSource {
     pub(crate) table_schema: TableSchema,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Predicate that references only the file row index virtual column (for
+    /// example the dynamic filter of a semi join on `file_row_index()`). It
+    /// cannot run in a `RowFilter`; instead the opener evaluates it on the row
+    /// numbers of each row group and turns the result into a `RowSelection`,
+    /// so it is applied exactly without reading any data.
+    pub(crate) row_index_predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Optional user defined parquet file reader factory
     pub(crate) parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
     /// Optional policy for deriving each file's Arrow schema after footer loading.
@@ -343,6 +349,7 @@ impl ParquetSource {
             table_parquet_options: TableParquetOptions::default(),
             metrics: ExecutionPlanMetricsSet::new(),
             predicate: None,
+            row_index_predicate: None,
             parquet_file_reader_factory: None,
             schema_provider: None,
             batch_size: None,
@@ -657,6 +664,7 @@ impl FileSource for ParquetSource {
             limit: base_config.limit,
             preserve_order: base_config.preserve_order,
             predicate: self.predicate.clone(),
+            row_index_predicate: self.row_index_predicate.clone(),
             table_schema: self.table_schema.clone(),
             metadata_size_hint: self.metadata_size_hint,
             metrics: self.metrics().clone(),
@@ -785,6 +793,9 @@ impl FileSource for ParquetSource {
                     .unwrap_or_default();
 
                 write!(f, "{predicate_string}")?;
+                if let Some(row_index_predicate) = &self.row_index_predicate {
+                    write!(f, ", row_index_predicate={row_index_predicate}")?;
+                }
 
                 // Inexact sort-pushdown markers: surface both flags so
                 // readers can see the optimization fired.
@@ -885,20 +896,44 @@ impl FileSource for ParquetSource {
         let pushdown_filters = table_pushdown_enabled || config_pushdown_enabled;
 
         let mut source = self.clone();
+        // Filters on the file row index alone are applied exactly through a
+        // row selection, whether or not `pushdown_filters` is enabled.
+        let mut row_index_filters = vec![];
         let filters: Vec<PushedDownPredicate> = filters
             .into_iter()
             .map(|filter| {
                 if can_expr_be_pushed_down_with_schemas(&filter, pushable_schema) {
+                    PushedDownPredicate::supported(filter)
+                } else if references_only_row_index(&filter, &self.table_schema) {
+                    row_index_filters.push(Arc::clone(&filter));
                     PushedDownPredicate::supported(filter)
                 } else {
                     PushedDownPredicate::unsupported(filter)
                 }
             })
             .collect();
-        if filters
-            .iter()
-            .all(|f| matches!(f.discriminant, PushedDown::No))
-        {
+        let has_row_index_filters = !row_index_filters.is_empty();
+        if has_row_index_filters {
+            source.row_index_predicate = Some(conjunction(
+                source
+                    .row_index_predicate
+                    .take()
+                    .into_iter()
+                    .chain(row_index_filters),
+            ));
+        }
+        let is_row_index = |filter: &Arc<dyn PhysicalExpr>| {
+            references_only_row_index(filter, &self.table_schema)
+        };
+        if filters.iter().all(|f| {
+            matches!(f.discriminant, PushedDown::No) || is_row_index(&f.predicate)
+        }) {
+            if has_row_index_filters {
+                return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                    filters.iter().map(|f| f.discriminant).collect(),
+                )
+                .with_updated_node(Arc::new(source) as _));
+            }
             // No filters can be pushed down, so we can just return the remaining filters
             // and avoid replacing the source in the physical plan.
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
@@ -907,6 +942,7 @@ impl FileSource for ParquetSource {
         }
         let allowed_filters = filters
             .iter()
+            .filter(|f| !is_row_index(&f.predicate))
             .filter_map(|f| match f.discriminant {
                 PushedDown::Yes => Some(Arc::clone(&f.predicate)),
                 PushedDown::No => None,
@@ -925,7 +961,16 @@ impl FileSource for ParquetSource {
         // even if we updated the predicate to include the filters (they will only be used for stats pruning).
         if !pushdown_filters {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; filters.len()],
+                filters
+                    .iter()
+                    .map(|f| {
+                        if is_row_index(&f.predicate) {
+                            PushedDown::Yes
+                        } else {
+                            PushedDown::No
+                        }
+                    })
+                    .collect(),
             )
             .with_updated_node(source));
         }
@@ -1111,6 +1156,7 @@ impl FileSource for ParquetSource {
         datafusion_physical_plan::apply_expression_roots(
             self.predicate
                 .iter()
+                .chain(self.row_index_predicate.iter())
                 .chain(self.projection.iter().map(|proj_expr| &proj_expr.expr)),
             f,
         )
@@ -1136,6 +1182,8 @@ impl FileSource for ParquetSource {
             // Carried by `base`.
             table_schema: _,
             predicate,
+            // Not serialized: see below.
+            row_index_predicate,
             // Rebuilt from the decode context.
             parquet_file_reader_factory: _,
             // Requires a custom codec for serialization.
@@ -1152,7 +1200,10 @@ impl FileSource for ParquetSource {
             sort_order_for_reorder,
         } = self;
 
-        if schema_provider.is_some() {
+        // The `ParquetScan` message has no field for a predicate on the file
+        // row index. Dropping it would be wrong: a static one is reported as
+        // applied by the scan.
+        if schema_provider.is_some() || row_index_predicate.is_some() {
             return Ok(None);
         }
 
@@ -1311,6 +1362,24 @@ impl ParquetSource {
             FileScanConfig::try_from_proto(base_conf, ctx, Arc::new(source))?;
         Ok(DataSourceExec::from_data_source(base_config))
     }
+}
+
+/// Returns true if `expr` references columns and all of them are
+/// [`RowNumber`] virtual columns of `table_schema`.
+pub(crate) fn references_only_row_index(
+    expr: &Arc<dyn PhysicalExpr>,
+    table_schema: &TableSchema,
+) -> bool {
+    let columns = datafusion_physical_expr::utils::collect_columns(expr);
+    !columns.is_empty()
+        && columns.iter().all(|column| {
+            table_schema.virtual_columns().iter().any(|field| {
+                field.name() == column.name()
+                    && field
+                        .extension_type_name()
+                        .is_some_and(|name| name == RowNumber::NAME)
+            })
+        })
 }
 
 /// Returns the a [`TableSchema`] containing a [`RowNumber`] virtual column and a [`Column`] expression referencing its row index column.
@@ -2169,12 +2238,14 @@ mod tests {
     }
 
     #[test]
-    fn test_try_pushdown_filters_rejects_virtual_column_refs() {
+    fn test_try_pushdown_filters_virtual_column_refs() {
         // Virtual columns are produced by the reader and cannot be referenced
-        // inside a RowFilter. `try_pushdown_filters` must report such filters
-        // as `PushedDown::No` so the FilterExec above the scan stays in
-        // place — otherwise the scan would silently drop the predicate and
-        // produce wrong results.
+        // inside a RowFilter. A filter that mixes a virtual column with file
+        // columns must be reported as `PushedDown::No` so the FilterExec above
+        // the scan stays in place — otherwise the scan would silently drop the
+        // predicate and produce wrong results. A filter on the row number
+        // virtual column alone is applied exactly as a row selection
+        // (`row_index_predicate`), so it is pushed down.
         use arrow::datatypes::{DataType, Field, FieldRef, Schema};
         use datafusion_common::config::ConfigOptions;
         use datafusion_datasource::TableSchema;
@@ -2230,8 +2301,8 @@ mod tests {
             "file-column filter should be pushable"
         );
         assert!(
-            matches!(prop.filters[1], PushedDown::No),
-            "filter referencing only a virtual column must not be pushed down"
+            matches!(prop.filters[1], PushedDown::Yes),
+            "filter referencing only the row number is applied as a row selection"
         );
         assert!(
             matches!(prop.filters[2], PushedDown::No),
@@ -2239,9 +2310,21 @@ mod tests {
              pushed down (row filter would silently drop it)"
         );
         assert!(
-            matches!(prop.filters[3], PushedDown::No),
-            "file_row_index() rewrites to a virtual column and must not be \
-             pushed down"
+            matches!(prop.filters[3], PushedDown::Yes),
+            "file_row_index() rewrites to the row number and is applied as a \
+             row selection"
+        );
+        let updated = prop
+            .updated_node
+            .expect("the row number filters update the source");
+        let updated = updated
+            .downcast_ref::<ParquetSource>()
+            .expect("a ParquetSource");
+        assert!(updated.row_index_predicate.is_some());
+        let predicate = updated.predicate.as_ref().expect("the pushable filter");
+        assert!(
+            !references_only_row_index(predicate, &updated.table_schema),
+            "row number filters must not enter the RowFilter predicate"
         );
     }
 }

@@ -18,6 +18,8 @@
 //! Shared state for query planning and execution.
 
 pub mod context;
+#[cfg(feature = "parquet")]
+pub mod late_materialization_join;
 pub mod session_state;
 pub use session_state::{SessionState, SessionStateBuilder};
 
