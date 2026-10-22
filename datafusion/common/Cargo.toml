@@ -85,6 +85,7 @@ num-traits = { workspace = true }
 object_store = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true, default-features = true }
 recursive = { workspace = true, optional = true }
+serde_json = { workspace = true }
 sqlparser = { workspace = true, optional = true }
 tokio = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

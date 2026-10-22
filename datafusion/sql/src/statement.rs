@@ -33,6 +33,7 @@ use arrow::datatypes::{Field, FieldRef, Fields, Metadata};
 use datafusion_common::error::_plan_err;
 use datafusion_common::format::ExplainStatementOptions;
 use datafusion_common::parsers::CompressionTypeVariant;
+use datafusion_common::types::DFEnum;
 use datafusion_common::{
     Column, Constraint, Constraints, DFSchema, DFSchemaRef, DataFusionError, Result,
     ScalarValue, SchemaError, SchemaReference, TableReference, ToDFSchema, exec_err,
@@ -50,12 +51,12 @@ use datafusion_expr::{
     Analyze, Cast, CreateCatalog, CreateCatalogSchema,
     CreateExternalCatalog as PlanCreateExternalCatalog,
     CreateExternalTable as PlanCreateExternalTable, CreateFunction, CreateFunctionBody,
-    CreateIndex as PlanCreateIndex, CreateMemoryTable, CreateView, Deallocate,
-    DescribeTable, DmlStatement, DropCatalog, DropCatalogSchema, DropFunction, DropTable,
-    DropView, EmptyRelation, Execute, Explain, ExplainFormat, Expr, ExprSchemable,
-    Filter, LogicalPlan, LogicalPlanBuilder, OperateFunctionArg, PlanType, Prepare,
-    ResetVariable, SetVariable, SortExpr, Statement as PlanStatement, ToStringifiedPlan,
-    TransactionAccessMode, TransactionConclusion, TransactionEnd,
+    CreateIndex as PlanCreateIndex, CreateMemoryTable, CreateType, CreateView,
+    Deallocate, DescribeTable, DmlStatement, DropCatalog, DropCatalogSchema,
+    DropFunction, DropTable, DropView, EmptyRelation, Execute, Explain, ExplainFormat,
+    Expr, ExprSchemable, Filter, LogicalPlan, LogicalPlanBuilder, OperateFunctionArg,
+    PlanType, Prepare, ResetVariable, SetVariable, SortExpr, Statement as PlanStatement,
+    ToStringifiedPlan, TransactionAccessMode, TransactionConclusion, TransactionEnd,
     TransactionIsolationLevel, TransactionStart, Volatility, WriteOp, cast,
 };
 use sqlparser::ast::{
@@ -1546,9 +1547,28 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     exec_err!("Function name not provided")
                 }
             }
-            Statement::CreateType { name, .. } => {
+            Statement::CreateType {
+                name,
+                representation,
+            } => {
                 let name = self.user_defined_type_name(&name)?;
-                not_impl_err!("Unsupported representation in CREATE TYPE {name}")
+                let field = match representation {
+                    Some(ast::UserDefinedTypeRepresentation::Enum { labels }) => {
+                        let labels =
+                            labels.into_iter().map(|label| label.value).collect();
+                        DFEnum::try_new(name.clone(), labels)?.to_field_ref()
+                    }
+                    _ => {
+                        return not_impl_err!(
+                            "Only enumerated types are supported in CREATE TYPE"
+                        );
+                    }
+                };
+                Ok(LogicalPlan::Ddl(DdlStatement::CreateType(CreateType {
+                    name,
+                    field,
+                    schema: DFSchemaRef::new(DFSchema::empty()),
+                })))
             }
             Statement::Truncate(ast::Truncate {
                 table_names,

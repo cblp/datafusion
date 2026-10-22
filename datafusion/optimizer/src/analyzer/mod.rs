@@ -34,6 +34,7 @@ use crate::utils::log_plan;
 
 use self::function_rewrite::ApplyFunctionRewrites;
 
+mod enum_coercion;
 pub mod function_rewrite;
 pub mod resolve_grouping_function;
 pub mod type_coercion;

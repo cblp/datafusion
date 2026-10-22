@@ -1941,6 +1941,7 @@ dependencies = [
  "parquet",
  "rand 0.9.4",
  "recursive",
+ "serde_json",
  "sqlparser",
  "tokio",
  "uuid",

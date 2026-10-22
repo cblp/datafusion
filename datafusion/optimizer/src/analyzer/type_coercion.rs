@@ -23,6 +23,7 @@ use itertools::{Itertools as _, izip};
 use std::sync::{Arc, LazyLock};
 
 use crate::analyzer::AnalyzerRule;
+use crate::analyzer::enum_coercion::coerce_enum_expr;
 use crate::utils::{NamePreserver, merge_into_schema};
 
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
@@ -724,6 +725,22 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
     type Node = Expr;
 
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
+        let Transformed {
+            data: expr,
+            transformed: enum_coerced,
+            ..
+        } = coerce_enum_expr(expr, self.schema)?;
+        let coerced = self.coerce_expr(expr)?;
+        Ok(if enum_coerced {
+            Transformed::yes(coerced.data)
+        } else {
+            coerced
+        })
+    }
+}
+
+impl TypeCoercionRewriter<'_> {
+    fn coerce_expr(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match expr {
             Expr::Unnest(_) => not_impl_err!(
                 "Unnest should be rewritten to LogicalPlan::Unnest before type coercion"
