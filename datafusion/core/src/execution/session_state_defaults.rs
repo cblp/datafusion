@@ -19,11 +19,14 @@ use crate::functions_nested;
 use crate::{functions, functions_aggregate, functions_table, functions_window};
 use datafusion_catalog::TableFunction;
 use datafusion_catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+use datafusion_common::types::DFEnum;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::planner::ExprPlanner;
-use datafusion_expr::registry::ExtensionTypeRegistrationRef;
+use datafusion_expr::registry::{
+    ExtensionTypeRegistration, ExtensionTypeRegistrationRef,
+};
 use datafusion_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, WindowUDF};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -123,7 +126,12 @@ impl SessionStateDefaults {
     ///
     /// For now, we do not register any extension types by default.
     pub fn default_extension_types() -> Vec<ExtensionTypeRegistrationRef> {
-        vec![]
+        vec![ExtensionTypeRegistration::new_arc(
+            DFEnum::NAME,
+            |storage_type, metadata| {
+                Ok(Arc::new(DFEnum::try_from_metadata(storage_type, metadata)?))
+            },
+        )]
     }
 
     /// returns the list of default [`TableFunction`]s
