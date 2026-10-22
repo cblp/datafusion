@@ -12,9 +12,10 @@ use arrow::datatypes::{
 use arrow::util::display::ArrayFormatter;
 use arrow::{array, array::ArrayRef, datatypes::DataType, record_batch::RecordBatch};
 use datafusion::common::internal_datafusion_err;
+use datafusion::common::types::DFEnum;
 use datafusion::config::ConfigField;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 /// Converts `batches` to a result as expected by sqllogictest.
 pub fn convert_batches(
@@ -33,11 +34,24 @@ pub fn convert_batches(
             )));
         }
 
+        // Show enum values as their labels
+        let columns = batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .map(|(field, col)| match DFEnum::try_from_field(field)? {
+                Some(enum_type) => {
+                    Ok(Arc::new(enum_type.decode(col.as_primitive())?) as ArrayRef)
+                }
+                None => Ok(Arc::clone(col)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         // Convert a single batch to a `Vec<Vec<String>>` for comparison, flatten expanded rows, and normalize each.
         let new_rows = (0..batch.num_rows())
             .map(|row| {
-                batch
-                    .columns()
+                columns
                     .iter()
                     .map(|col| cell_to_string(col, row, is_spark_path))
                     .collect::<Result<Vec<String>>>()
@@ -254,7 +268,13 @@ pub fn cell_to_string(col: &ArrayRef, row: usize, is_spark_path: bool) -> Result
 pub fn convert_schema_to_types(columns: &Fields) -> Vec<DFColumnType> {
     columns
         .iter()
-        .map(|f| f.data_type())
+        .map(|f| {
+            if f.extension_type_name() == Some(DFEnum::NAME) {
+                &DataType::Utf8
+            } else {
+                f.data_type()
+            }
+        })
         .map(|data_type| match data_type {
             DataType::Boolean => DFColumnType::Boolean,
             DataType::Int8

@@ -1,0 +1,174 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+##########
+## Enumerated types (CREATE TYPE ... AS ENUM)
+##########
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+statement error type "mood" already exists
+CREATE TYPE mood AS ENUM ('a');
+
+statement error Enum label "a" used more than once
+CREATE TYPE dup AS ENUM ('a', 'a');
+
+statement error Unsupported SQL type nope
+CREATE TABLE bad (m nope);
+
+statement ok
+CREATE TABLE person (name VARCHAR, current_mood mood);
+
+statement ok
+INSERT INTO person VALUES ('Moe', 'happy'), ('Larry', 'sad'), ('Curly', 'ok'), ('Shemp', NULL);
+
+statement error invalid input value for enum mood: "angry"
+INSERT INTO person VALUES ('Joe', 'angry');
+
+# Values are shown as labels; the storage type is Int16
+query TTT
+SELECT name, current_mood, arrow_typeof(current_mood) FROM person ORDER BY name;
+----
+Curly ok Int16
+Larry sad Int16
+Moe happy Int16
+Shemp NULL Int16
+
+# Sorting follows the declaration order of the labels, not the alphabetical order
+query TT
+SELECT name, current_mood FROM person ORDER BY current_mood, name;
+----
+Larry sad
+Curly ok
+Moe happy
+Shemp NULL
+
+# Comparisons with text literals use the declaration order
+query T
+SELECT name FROM person WHERE current_mood = 'happy';
+----
+Moe
+
+query T
+SELECT name FROM person WHERE current_mood > 'sad' ORDER BY name;
+----
+Curly
+Moe
+
+query T
+SELECT name FROM person WHERE 'ok' >= current_mood ORDER BY name;
+----
+Curly
+Larry
+
+query T
+SELECT name FROM person WHERE current_mood IN ('sad', 'happy') ORDER BY name;
+----
+Larry
+Moe
+
+query T
+SELECT name FROM person WHERE current_mood BETWEEN 'ok' AND 'happy' ORDER BY name;
+----
+Curly
+Moe
+
+statement error invalid input value for enum mood: "angry"
+SELECT name FROM person WHERE current_mood = 'angry';
+
+# The text literal is converted to a code at planning time
+query TT
+EXPLAIN SELECT name FROM person WHERE current_mood = 'happy';
+----
+logical_plan
+01)Projection: person.name
+02)--Filter: person.current_mood = Int16(2) FieldMetadata { inner: {"ARROW:extension:metadata": "{\"name\":\"mood\",\"labels\":[\"sad\",\"ok\",\"happy\"]}", "ARROW:extension:name": "datafusion.enum"} }
+03)----TableScan: person projection=[name, current_mood]
+physical_plan
+01)FilterExec: current_mood@1 = 2, projection=[name@0]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+# Casts between text and enums
+query TT
+SELECT 'ok'::mood, arrow_typeof('ok'::mood);
+----
+ok Int16
+
+query TT
+SELECT current_mood::text, arrow_typeof(current_mood::text) FROM person ORDER BY name;
+----
+ok Utf8View
+sad Utf8View
+happy Utf8View
+NULL Utf8View
+
+query T
+SELECT upper(current_mood::text) FROM person WHERE name = 'Moe';
+----
+HAPPY
+
+statement error invalid input value for enum mood: "meh"
+SELECT 'meh'::mood;
+
+# Aggregation and grouping work on the codes
+query TI
+SELECT current_mood, count(*) FROM person GROUP BY current_mood ORDER BY current_mood;
+----
+sad 1
+ok 1
+happy 1
+NULL 1
+
+# Operations that treat codes as numbers are rejected
+statement error Operator \+ is not supported for enum type mood
+SELECT current_mood + 1 FROM person;
+
+statement error Cannot convert Int64 to enum type mood
+SELECT name FROM person WHERE current_mood = 1;
+
+statement error Cannot cast enum type mood to Int32
+SELECT current_mood::int FROM person;
+
+statement ok
+CREATE TYPE color AS ENUM ('red', 'green');
+
+statement error Cannot compare enum types color and mood
+SELECT name FROM person WHERE 'red'::color = current_mood;
+
+# Comparing two values of the same enum type
+query TT
+SELECT a.name, b.name FROM person a JOIN person b ON a.current_mood < b.current_mood ORDER BY a.name, b.name;
+----
+Curly Moe
+Larry Curly
+Larry Moe
+
+##########
+## Storage in Parquet files
+##########
+
+statement ok
+COPY person TO 'test_files/scratch/enum_type/person.parquet' STORED AS PARQUET;
+
+# The type definition is stored in the file, no CREATE TYPE is needed to read it
+statement ok
+CREATE EXTERNAL TABLE person_parquet STORED AS PARQUET LOCATION 'test_files/scratch/enum_type/person.parquet';
+
+query TT
+SELECT name, current_mood FROM person_parquet WHERE current_mood >= 'ok' ORDER BY current_mood DESC;
+----
+Moe happy
+Curly ok
+
+query T
+SELECT name FROM person_parquet WHERE current_mood = 'sad';
+----
+Larry
+
+statement ok
+DROP TABLE person_parquet;
+
+statement ok
+DROP TABLE person;

@@ -5,6 +5,7 @@
 //! Print format variants
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::print_options::MaxRows;
 
@@ -15,6 +16,9 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches_with_options;
 use datafusion::config::FormatOptions;
 use datafusion::error::Result;
+use datafusion::execution::SessionStateDefaults;
+use datafusion::logical_expr::extension_types::DFArrayFormatterFactory;
+use datafusion::logical_expr::registry::MemoryExtensionTypeRegistry;
 
 /// Allow records to be printed in different formats
 #[derive(Debug, PartialEq, Eq, clap::ValueEnum, Clone, Copy)]
@@ -100,6 +104,12 @@ fn format_batches_with_maxrows<W: std::io::Write>(
     format_options: &FormatOptions,
 ) -> Result<()> {
     let options: arrow::util::display::FormatOptions = format_options.try_into()?;
+    // Format extension types such as enums with their default formatters.
+    let registry = MemoryExtensionTypeRegistry::new_with_types(
+        SessionStateDefaults::default_extension_types(),
+    )?;
+    let formatter_factory = DFArrayFormatterFactory::new(Arc::new(registry));
+    let options = options.with_formatter_factory(Some(&formatter_factory));
 
     match maxrows {
         MaxRows::Limited(maxrows) => {

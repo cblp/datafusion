@@ -4,6 +4,7 @@
 
 mod builtin;
 mod canonical_extensions;
+mod enum_type;
 mod extension;
 mod field;
 mod logical;
@@ -11,6 +12,7 @@ mod native;
 
 pub use builtin::*;
 pub use canonical_extensions::*;
+pub use enum_type::*;
 pub use extension::*;
 pub use field::*;
 pub use logical::*;
