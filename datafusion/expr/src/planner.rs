@@ -98,6 +98,13 @@ pub trait ContextProvider {
         &[]
     }
 
+    /// Returns the user defined type (created with `CREATE TYPE`) named `name`, if any.
+    ///
+    /// The returned field holds the storage type and the extension type metadata.
+    fn get_user_defined_type(&self, _name: &str) -> Option<FieldRef> {
+        None
+    }
+
     /// Return [`TypePlanner`] extensions for planning data types
     #[cfg(feature = "sql")]
     fn get_type_planner(&self) -> Option<Arc<dyn TypePlanner>> {

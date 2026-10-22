@@ -27,7 +27,7 @@ use std::{
 use crate::expr::Sort;
 #[cfg(not(feature = "sql"))]
 use crate::sql::Ident;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, FieldRef};
 use datafusion_common::tree_node::{Transformed, TreeNodeContainer, TreeNodeRecursion};
 use datafusion_common::{
     Constraints, DFSchema, DFSchemaRef, Result, SchemaReference, TableReference,
@@ -67,6 +67,8 @@ pub enum DdlStatement {
     CreateFunction(Box<CreateFunction>),
     /// Drop function statement
     DropFunction(DropFunction),
+    /// Creates a user defined type.
+    CreateType(CreateType),
 }
 
 impl DdlStatement {
@@ -88,6 +90,7 @@ impl DdlStatement {
             DdlStatement::DropCatalog(DropCatalog { schema, .. }) => schema,
             DdlStatement::CreateFunction(cf) => &cf.schema,
             DdlStatement::DropFunction(DropFunction { schema, .. }) => schema,
+            DdlStatement::CreateType(CreateType { schema, .. }) => schema,
         }
     }
 
@@ -108,6 +111,7 @@ impl DdlStatement {
             DdlStatement::DropCatalog(_) => "DropCatalog",
             DdlStatement::CreateFunction(_) => "CreateFunction",
             DdlStatement::DropFunction(_) => "DropFunction",
+            DdlStatement::CreateType(_) => "CreateType",
         }
     }
 
@@ -129,6 +133,7 @@ impl DdlStatement {
             DdlStatement::DropCatalog(_) => vec![],
             DdlStatement::CreateFunction(_) => vec![],
             DdlStatement::DropFunction(_) => vec![],
+            DdlStatement::CreateType(_) => vec![],
         }
     }
 
@@ -214,6 +219,9 @@ impl DdlStatement {
                     }
                     DdlStatement::DropFunction(DropFunction { name, .. }) => {
                         write!(f, "DropFunction: name {name:?}")
+                    }
+                    DdlStatement::CreateType(CreateType { name, .. }) => {
+                        write!(f, "CreateType: name {name:?}")
                     }
                 }
             }
@@ -1032,6 +1040,30 @@ impl PartialOrd for DropFunction {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match self.name.partial_cmp(&other.name) {
             Some(Ordering::Equal) => self.if_exists.partial_cmp(&other.if_exists),
+            cmp => cmp,
+        }
+        // TODO (https://github.com/apache/datafusion/issues/17477) avoid recomparing all fields
+        .filter(|cmp| *cmp != Ordering::Equal || self == other)
+    }
+}
+
+/// Creates a user defined type, such as an enumerated type
+/// (`CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')`).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct CreateType {
+    /// The type name
+    pub name: String,
+    /// The definition of the type as a field without a name. The field holds the storage type
+    /// and the extension type metadata.
+    pub field: FieldRef,
+    /// Empty schema
+    pub schema: DFSchemaRef,
+}
+
+impl PartialOrd for CreateType {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match self.name.partial_cmp(&other.name) {
+            Some(Ordering::Equal) => self.field.partial_cmp(&other.field),
             cmp => cmp,
         }
         // TODO (https://github.com/apache/datafusion/issues/17477) avoid recomparing all fields

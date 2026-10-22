@@ -46,9 +46,10 @@ use crate::{
     logical_expr::ScalarUDF,
     logical_expr::{
         CreateCatalog, CreateCatalogSchema, CreateExternalCatalog, CreateExternalTable,
-        CreateFunction, CreateMemoryTable, CreateView, DropCatalog, DropCatalogSchema,
-        DropFunction, DropTable, DropView, Execute, LogicalPlan, LogicalPlanBuilder,
-        Prepare, ResetVariable, SetVariable, TableType, UNNAMED_TABLE,
+        CreateFunction, CreateMemoryTable, CreateType, CreateView, DropCatalog,
+        DropCatalogSchema, DropFunction, DropTable, DropView, Execute, LogicalPlan,
+        LogicalPlanBuilder, Prepare, ResetVariable, SetVariable, TableType,
+        UNNAMED_TABLE,
     },
     physical_expr::PhysicalExpr,
     physical_plan::ExecutionPlan,
@@ -732,6 +733,7 @@ impl SessionContext {
                         Box::pin(self.create_function(*cmd)).await
                     }
                     DdlStatement::DropFunction(cmd) => self.drop_function(&cmd),
+                    DdlStatement::CreateType(cmd) => self.create_type(cmd),
                     ddl => Ok(DataFrame::new(self.state(), LogicalPlan::Ddl(ddl))),
                 }
             }
@@ -1601,6 +1603,17 @@ impl SessionContext {
             RegisterFunction::Table(name, f) => self.register_udtf(&name, f),
         }
 
+        self.return_empty_dataframe()
+    }
+
+    fn create_type(&self, stmt: CreateType) -> Result<DataFrame> {
+        let CreateType { name, field, .. } = stmt;
+        let mut state = self.state.write();
+        if state.user_defined_type(&name).is_some() {
+            return plan_err!("type \"{name}\" already exists");
+        }
+        state.register_user_defined_type(name, field);
+        drop(state);
         self.return_empty_dataframe()
     }
 

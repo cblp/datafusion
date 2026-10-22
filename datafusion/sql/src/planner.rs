@@ -700,9 +700,29 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             SQLDataType::Array(ArrayElemTypeDef::None) => {
                 not_impl_err!("Arrays with unspecified type is not supported")
             }
+            SQLDataType::Custom(name, modifiers)
+                if modifiers.is_empty()
+                    && let Some(field) =
+                        self.user_defined_type_name(name).ok().and_then(|name| {
+                            self.context_provider.get_user_defined_type(&name)
+                        }) =>
+            {
+                Ok(field)
+            }
             other => Ok(self
                 .convert_simple_data_type(other)?
                 .into_nullable_field_ref()),
+        }
+    }
+
+    /// Returns the normalized name of a user defined type.
+    pub(crate) fn user_defined_type_name(&self, name: &ObjectName) -> Result<String> {
+        match &name.0[..] {
+            [part] => match part.as_ident() {
+                Some(ident) => Ok(self.ident_normalizer.normalize(ident.clone())),
+                None => plan_err!("Invalid type name: {name}"),
+            },
+            _ => not_impl_err!("Qualified type names are not supported: {name}"),
         }
     }
 

@@ -231,6 +231,8 @@ struct SessionStateInner {
     /// Cache logical plans of prepared statements for later execution.
     /// Key is the prepared statement name.
     prepared_plans: HashMap<String, Arc<PreparedPlan>>,
+    /// User defined types created with `CREATE TYPE`, keyed by type name.
+    user_defined_types: HashMap<String, FieldRef>,
 }
 
 impl PhysicalOptimizerContext for SessionState {
@@ -1118,6 +1120,25 @@ impl SessionState {
         self.inner.prepared_plans.get(name).map(Arc::clone)
     }
 
+    /// Registers a user defined type named `name`, returning the type previously registered
+    /// under that name, if any.
+    ///
+    /// The `field` holds the storage type and the extension type metadata of the type.
+    pub fn register_user_defined_type(
+        &mut self,
+        name: impl Into<String>,
+        field: FieldRef,
+    ) -> Option<FieldRef> {
+        Arc::make_mut(&mut self.inner)
+            .user_defined_types
+            .insert(name.into(), field)
+    }
+
+    /// Returns the user defined type named `name`, if any.
+    pub fn user_defined_type(&self, name: &str) -> Option<&FieldRef> {
+        self.inner.user_defined_types.get(name)
+    }
+
     /// Remove the prepared plan with the given name.
     pub(crate) fn remove_prepared(
         &mut self,
@@ -1762,6 +1783,7 @@ impl SessionStateBuilder {
             cache_factory,
             statistics_registry,
             prepared_plans: HashMap::new(),
+            user_defined_types: HashMap::new(),
         });
 
         let mut state = SessionState {
@@ -2117,6 +2139,10 @@ impl ContextProvider for SessionContextProvider<'_> {
         } else {
             None
         }
+    }
+
+    fn get_user_defined_type(&self, name: &str) -> Option<FieldRef> {
+        self.state.user_defined_type(name).cloned()
     }
 
     fn get_table_source(

@@ -483,6 +483,7 @@ fn map_children_mut<F: FnMut(&mut LogicalPlan) -> Result<bool>>(
         | LogicalPlan::Ddl(DdlStatement::DropCatalog(_))
         | LogicalPlan::Ddl(DdlStatement::CreateFunction(_))
         | LogicalPlan::Ddl(DdlStatement::DropFunction(_))
+        | LogicalPlan::Ddl(DdlStatement::CreateType(_))
         | LogicalPlan::Statement(_) => false,
     })
 }

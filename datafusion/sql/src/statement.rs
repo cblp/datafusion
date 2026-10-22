@@ -1546,6 +1546,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     exec_err!("Function name not provided")
                 }
             }
+            Statement::CreateType { name, .. } => {
+                let name = self.user_defined_type_name(&name)?;
+                not_impl_err!("Unsupported representation in CREATE TYPE {name}")
+            }
             Statement::Truncate(ast::Truncate {
                 table_names,
                 partitions,
