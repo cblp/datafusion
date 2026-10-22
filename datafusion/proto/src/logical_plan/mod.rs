@@ -2316,6 +2316,9 @@ impl AsLogicalPlan for LogicalPlanNode {
             LogicalPlan::Ddl(DdlStatement::DropFunction(_)) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for DropFunction",
             )),
+            LogicalPlan::Ddl(DdlStatement::CreateType(_)) => Err(proto_error(
+                "LogicalPlan serde is not yet implemented for CreateType",
+            )),
             LogicalPlan::Statement(_) => Err(proto_error(
                 "LogicalPlan serde is not yet implemented for Statement",
             )),
