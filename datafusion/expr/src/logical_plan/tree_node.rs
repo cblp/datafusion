@@ -321,7 +321,8 @@ impl TreeNode for LogicalPlan {
                     | DdlStatement::DropCatalogSchema(_)
                     | DdlStatement::DropCatalog(_)
                     | DdlStatement::CreateFunction(_)
-                    | DdlStatement::DropFunction(_) => Transformed::no(ddl),
+                    | DdlStatement::DropFunction(_)
+                    | DdlStatement::CreateType(_) => Transformed::no(ddl),
                 }
                 .update_data(LogicalPlan::Ddl)
             }
