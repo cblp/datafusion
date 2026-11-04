@@ -11,7 +11,7 @@ use std::iter::once;
 use std::sync::Arc;
 
 use crate::dml::CopyTo;
-use crate::expr::{Alias, PlannedReplaceSelectItem, Sort as SortExpr};
+use crate::expr::{Alias, Cast, PlannedReplaceSelectItem, Sort as SortExpr};
 use crate::expr_rewriter::{
     ColumnNormalizer, coerce_plan_expr_for_schema, normalize_col,
     normalize_col_with_schemas_and_ambiguity_check, normalize_cols, normalize_sorts,
@@ -40,6 +40,7 @@ use super::dml::InsertOp;
 use crate::logical_plan::information_schema::ColumnsDetail;
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::metadata::FieldMetadata;
@@ -520,8 +521,26 @@ impl LogicalPlanBuilder {
         let fields = fields.into_fields();
         // wrap cast if data type is not same as common type.
         for row in &mut values {
-            for (j, field_type) in fields.iter().map(|f| f.data_type()).enumerate() {
-                if let Expr::Literal(ScalarValue::Null, metadata) = &row[j] {
+            for (j, field) in fields.iter().enumerate() {
+                let field_type = field.data_type();
+                if field.extension_type_name().is_some() {
+                    // Cast to the extension type, not only to its storage type
+                    let value = std::mem::take(&mut row[j]);
+                    row[j] = if value.metadata(schema)?
+                        == FieldMetadata::from(field.as_ref())
+                    {
+                        value.cast_to(field_type, schema)?
+                    } else {
+                        let target = field_type
+                            .clone()
+                            .into_nullable_field()
+                            .with_metadata(field.metadata().clone());
+                        Expr::Cast(Cast::new_from_field(
+                            Box::new(value),
+                            Arc::new(target),
+                        ))
+                    };
+                } else if let Expr::Literal(ScalarValue::Null, metadata) = &row[j] {
                     row[j] = Expr::Literal(
                         ScalarValue::try_from(field_type)?,
                         metadata.clone(),
